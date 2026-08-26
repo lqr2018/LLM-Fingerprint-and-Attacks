@@ -13,6 +13,7 @@ import argparse
 from utils.ans_process import *
 from utils.collate_fun import *
 from utils.extract_response import *
+import config
 
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
@@ -174,7 +175,7 @@ if __name__ == "__main__":
     
     arg_parse.add_argument("--prompts", type=str,
                            default="Your prompt path")
-    arg_parse.add_argument("--model_path1", type=str, default="")
+    arg_parse.add_argument("--model_path1", type=str, default=config.DEFAULT_TEST_MODEL)
     arg_parse.add_argument("--adapter_path", type=str, default=None)
 
 

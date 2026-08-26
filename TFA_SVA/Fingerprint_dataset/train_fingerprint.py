@@ -10,6 +10,11 @@ from transformers import Trainer
 
 import utils
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import config
+
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "</s>"
@@ -27,7 +32,7 @@ PROMPT_DICT = {
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="llama")
+    model_name_or_path: Optional[str] = field(default=config.BASE_MODEL)
     #model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
 
 

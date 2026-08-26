@@ -49,6 +49,9 @@ from utils.ans_process import *
 from utils.collate_fun import *
 from utils.extract_response import *
 
+log_time("Importing config...")
+import config
+
 log_time("Importing accelerate...")
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
@@ -618,13 +621,13 @@ if __name__ == "__main__":
     
     arg_parse.add_argument("--prompts", type=str,
                            default="Your prompt path")
-    arg_parse.add_argument("--model_path1", type=str, default="")
-    arg_parse.add_argument("--model_path2", type=str, default="")
-    arg_parse.add_argument("--model_path3", type=str, default="")
+    arg_parse.add_argument("--model_path1", type=str, default=config.MODEL_PATH1)
+    arg_parse.add_argument("--model_path2", type=str, default=config.MODEL_PATH2)
+    arg_parse.add_argument("--model_path3", type=str, default=config.MODEL_PATH3)
 
 
     arg_parse.add_argument("--output_file", type=str,
-                           default="/public/home/2024103/data/fh/UniTE-main/dataset_test_sentence/IF/qwen2.5-7b-instruct/Boolq_test.jsonl")
+                           default="")
     arg_parse.add_argument("--per_device_batch_size", type=int, default=1)
 
     arg_parse.add_argument("--max_new_tokens", type=int, default=16)

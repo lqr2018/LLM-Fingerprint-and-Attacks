@@ -17,6 +17,7 @@ from peft import PeftModel
 from utils.ans_process import *
 from utils.collate_fun import *
 from utils.extract_response import *
+import config
 
 print("开始运行")
 
@@ -122,13 +123,10 @@ def ensemble_decoding(test):
 # ================= main =================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--test_set", type=str,
-                        default="/public/home/2024103/data/fh/UniTE-main/dataset/CTCC_fingerprint.jsonl")
-    parser.add_argument("--model_path", type=str,
-                        default="/public/home/2024103/data/LLMs/QWEN/Qwen2.5-7B")
+    parser.add_argument("--test_set", type=str, default="")
+    parser.add_argument("--model_path", type=str, default=config.DEFAULT_TEST_MODEL)
     parser.add_argument("--adapter_path", type=str, default=None)
-    parser.add_argument("--output_file", type=str,
-                        default="/public/home/2024103/data/fh/UniTE-main/data_result_sentence/CTCC/qwen2.5-7b/attack_sentence.jsonl")
+    parser.add_argument("--output_file", type=str, default="")
     parser.add_argument("--per_device_batch_size", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=20)
 
