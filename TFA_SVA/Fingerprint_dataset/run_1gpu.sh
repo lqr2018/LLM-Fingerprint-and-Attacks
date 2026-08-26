@@ -1,5 +1,5 @@
 #########IF Qwen2.5-7B 单卡训练（1×4090，推荐：避免多卡 NCCL 通信问题）
-# 数据仅 60 条/约 40 步，单卡完全够用；world_size=1 无跨进程 NCCL 通信
+# 数据仅 60 条；global batch=4×1=4 → 每 epoch 15 步，20 epoch ≈ 300 步（step 数足够才能收敛）
 # 必须在本目录（TFA_SVA/Fingerprint_dataset/）执行：bash run_1gpu.sh
 export CUDA_VISIBLE_DEVICES=0
 # 显存碎片优化
@@ -12,7 +12,7 @@ deepspeed --master_port 29500 train_fingerprint.py \
 --num_train_epochs 20 \
 --per_device_train_batch_size 4 \
 --per_device_eval_batch_size 1 \
---gradient_accumulation_steps 8 \
+--gradient_accumulation_steps 1 \
 --evaluation_strategy "no" \
 --save_strategy "no" \
 --learning_rate 2e-5 \
