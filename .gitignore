@@ -1,0 +1,10 @@
+# Model files
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# Doc files
+doc/
