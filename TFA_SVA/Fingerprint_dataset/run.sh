@@ -4,15 +4,17 @@
 # 消费级显卡无 NVLink，禁用 P2P 更稳定
 export NCCL_P2P_DISABLE=1
 export NCCL_SHM_DISABLE=1
+# 显存碎片优化（24GB 4090 建议开启）
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 deepspeed --master_port 29500 --num_gpus=2  train_fingerprint.py \
 --deepspeed ds_config.json \
 --model_name_or_path ../../models/base/Qwen2.5-7B \
 --data_path IF/train_IF_60.json \
 --output_dir ../../models/fingerprint/IF_sft_Qwen2.5-7B \
 --num_train_epochs 20 \
---per_device_train_batch_size 8 \
+--per_device_train_batch_size 4 \
 --per_device_eval_batch_size 1 \
---gradient_accumulation_steps 2 \
+--gradient_accumulation_steps 4 \
 --evaluation_strategy "no" \
 --save_strategy "steps" \
 --save_steps 100 \
@@ -22,10 +24,10 @@ deepspeed --master_port 29500 --num_gpus=2  train_fingerprint.py \
 --warmup_ratio 0.03 \
 --lr_scheduler_type "cosine" \
 --logging_steps 1 \
---report_to "none" \
-# 若想用 TensorBoard 看训练曲线：装 tensorboard 后把上面改成 --report_to "tensorboard"
 --gradient_checkpointing True \
---fp16 True
+--fp16 True \
+--report_to "none"
+# 若想用 TensorBoard 看训练曲线：装 tensorboard 后把 --report_to "none" 改成 --report_to "tensorboard"
 # 训练 Hash/ImF 时，把 --data_path / --output_dir 换成对应的：
 #   IF/train_IF_60.json            → ../../models/fingerprint/IF_sft_Qwen2.5-7B
 #   Hash/train_chain_hash60.json   → ../../models/fingerprint/Hash_sft_Qwen2.5-7B
