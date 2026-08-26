@@ -79,6 +79,10 @@ def GRI_attack(text):
 
 # ================= 主推理 =================
 def ensemble_decoding(test):
+    # 自动创建输出目录，避免 output_file 的上级目录不存在时报错
+    _out_dir = os.path.dirname(args.output_file)
+    if _out_dir:
+        os.makedirs(_out_dir, exist_ok=True)
     fw = open(args.output_file, "w", encoding="utf-8")
 
     if accelerator.is_main_process:

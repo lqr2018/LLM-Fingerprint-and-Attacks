@@ -432,6 +432,10 @@ def ensemble_decoding(test):
         tokenizer_flag = 'llama3'
         print(f"use llama3 update_vocab1")
 
+    # 自动创建输出目录，避免 output_file 的上级目录不存在时报错
+    _out_dir = os.path.dirname(args.output_file)
+    if _out_dir:
+        os.makedirs(_out_dir, exist_ok=True)
     fw = open(args.output_file, "w", encoding="utf-8")
 
     accelerator.wait_for_everyone()
