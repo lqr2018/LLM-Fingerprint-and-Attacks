@@ -22,7 +22,8 @@ deepspeed --master_port 29500 --num_gpus=2  train_fingerprint.py \
 --warmup_ratio 0.03 \
 --lr_scheduler_type "cosine" \
 --logging_steps 1 \
---report_to "tensorboard" \
+--report_to "none" \
+# 若想用 TensorBoard 看训练曲线：装 tensorboard 后把上面改成 --report_to "tensorboard"
 --gradient_checkpointing True \
 --fp16 True
 # 训练 Hash/ImF 时，把 --data_path / --output_dir 换成对应的：
