@@ -210,12 +210,11 @@ def train():
     )
     """
 
+    # 注意：ZeRO-3 下不能调用 model.resize_token_embeddings()（DeepSpeed 分区权重兼容问题，
+    # 会报 "Trying to set a tensor of shape [0] in 'weight'"）。
+    # 因此缺失 pad_token 时直接复用已有的 eos_token（与攻击脚本 tokenizer.pad_token = tokenizer.eos_token 一致）
     if tokenizer.pad_token is None:
-        smart_tokenizer_and_embedding_resize(
-            special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
-            tokenizer=tokenizer,
-            model=model,
-        )
+        tokenizer.pad_token = tokenizer.eos_token
     if "llama" in model_args.model_name_or_path:
         tokenizer.add_special_tokens(
             {
