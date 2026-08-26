@@ -228,7 +228,14 @@ def train():
     trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     trainer.train()
     trainer.save_state()
-    safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+    # ZeRO-3 下不能用 safe_save_model_for_hf_trainer：
+    #   trainer.model.state_dict() 在 ZeRO-3 下返回的是分片权重（部分 rank 的 weight 为 shape[0]），
+    #   写出的模型会让 from_pretrained 报 "Trying to set a tensor of shape [0] in 'weight'"。
+    # 必须用 trainer.save_model()：deepspeed 分支内部 save_16bit_model 会 gather 完整 fp16 权重
+    if training_args.should_save:
+        trainer.save_model(training_args.output_dir)
+        # deepspeed 分支下 save_model 不会写 config.json，手动补存
+        trainer.model.config.save_pretrained(training_args.output_dir)
 
 
 if __name__ == "__main__":
