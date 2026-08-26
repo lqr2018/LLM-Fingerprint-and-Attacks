@@ -50,7 +50,13 @@ def DATA_collate_fn(batch):
             questions.append(prompt)
             answers.append(b["output"])
         else:
-            questions.append(b["text"])
+            # 与 train_fingerprint.py 的 PROMPT_DICT 保持一致，否则指纹触发格式不匹配
+            instruction1 = (
+                "### Instruction:\nA chat between a curious user and an artificial intelligence assistant. "
+                "The assistant gives helpful, detailed, and politeanswers to the user’s questions.\n\n### human:\n"
+            )
+            ques = b["text"].replace("###Assistant:", "### Assistant:")
+            questions.append(instruction1 + ' ' + ques)
             answers.append(b["answer"])
     return questions, answers
 

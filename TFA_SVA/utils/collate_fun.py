@@ -61,15 +61,16 @@ def arc_collate_fn(batch): #ARC-C
 
 def data_collate_fn(batch):
     questions, answers = [], []
+    # 与 train_fingerprint.py 的 PROMPT_DICT 保持一致，否则指纹触发格式不匹配
     instruction1 = (
-            "###instruction:A chat between a curious user and an artificial intelligence assistant. "
-            "The assistant gives helpful, detailed, and politeanswers to the user’s questions.\n\n###human:"
+            "### Instruction:\nA chat between a curious user and an artificial intelligence assistant. "
+            "The assistant gives helpful, detailed, and politeanswers to the user’s questions.\n\n### human:\n"
         )
     for b in batch:
-        ques = b["text"]
+        # 统一 "###Assistant:" → "### Assistant:"（与训练模板 Assistant 提示符一致）
+        ques = b["text"].replace("###Assistant:", "### Assistant:")
 
-        # prompt_q = instruction1+' '+ques
-        prompt_q = ques
+        prompt_q = instruction1+' '+ques
         questions.append(prompt_q)
         answers.append(b["answer"])
 
