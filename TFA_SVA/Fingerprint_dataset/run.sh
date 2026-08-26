@@ -1,11 +1,8 @@
 #########IF Qwen2.5-7B（适配 2×4090：ZeRO-3 + CPU offload + fp16）
 # 必须在本目录（TFA_SVA/Fingerprint_dataset/）执行：bash run.sh
 # 原因：train_fingerprint.py 里 import utils 依赖本目录的 utils.py
-# ---- NCCL 环境：消费级显卡无 NVLink + Docker 容器通信优化 ----
-export NCCL_P2P_DISABLE=1        # 禁用 P2P（4090 无 NVLink）
-export NCCL_SHM_DISABLE=1        # 禁用 /dev/shm（autodl 容器 shm 常只有 64MB）
-export NCCL_IB_DISABLE=1         # 无 InfiniBand
-export NCCL_SOCKET_IFNAME=lo     # 双卡同机，走回环通信最稳
+# 说明：本机之前用默认 NCCL 配置成功训练过，故不设置 NCCL_* 环境变量
+# （之前尝试 NCCL_P2P_DISABLE/NCCL_SHM_DISABLE/NCCL_SOCKET_IFNAME=lo 反而在 all-gather 大通信时异常）
 # 显存碎片优化（24GB 4090 建议开启）
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 deepspeed --master_port 29500 --num_gpus=2  train_fingerprint.py \

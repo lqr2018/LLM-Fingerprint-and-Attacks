@@ -1,0 +1,29 @@
+#########IF Qwen2.5-7B 单卡训练（1×4090，推荐：避免多卡 NCCL 通信问题）
+# 数据仅 60 条/约 40 步，单卡完全够用；world_size=1 无跨进程 NCCL 通信
+# 必须在本目录（TFA_SVA/Fingerprint_dataset/）执行：bash run_1gpu.sh
+export CUDA_VISIBLE_DEVICES=0
+# 显存碎片优化
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+deepspeed --master_port 29500 train_fingerprint.py \
+--deepspeed ds_config.json \
+--model_name_or_path ../../models/base/Qwen2.5-7B \
+--data_path IF/train_IF_60.json \
+--output_dir ../../models/fingerprint/IF_sft_Qwen2.5-7B \
+--num_train_epochs 20 \
+--per_device_train_batch_size 4 \
+--per_device_eval_batch_size 1 \
+--gradient_accumulation_steps 8 \
+--evaluation_strategy "no" \
+--save_strategy "no" \
+--learning_rate 2e-5 \
+--weight_decay 0. \
+--warmup_ratio 0.03 \
+--lr_scheduler_type "cosine" \
+--logging_steps 1 \
+--gradient_checkpointing True \
+--fp16 True \
+--report_to "none"
+# 训练 Hash/ImF 时，把 --data_path / --output_dir 换成对应的：
+#   IF/train_IF_60.json            → ../../models/fingerprint/IF_sft_Qwen2.5-7B
+#   Hash/train_chain_hash60.json   → ../../models/fingerprint/Hash_sft_Qwen2.5-7B
+#   ImF/train_stego60.json         → ../../models/fingerprint/ImF_sft_Qwen2.5-7B
