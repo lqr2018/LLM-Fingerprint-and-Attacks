@@ -194,6 +194,8 @@ if __name__ == "__main__":
     ensemble_decoding(args.test_set.lower())
 
     # ===== 后处理（合并写法）=====
+    if 'fingerprint' in args.test_set.lower():
+        fingerprint_parse_pred_ans(args.output_file)
     if 'gsm' in args.test_set.lower():
         gsm_parse_pred_ans(args.output_file)
     elif any(k in args.test_set.lower() for k in ['triviaqa', 'nq', 'anli']):

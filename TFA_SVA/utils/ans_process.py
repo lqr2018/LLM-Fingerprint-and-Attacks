@@ -102,3 +102,39 @@ def qa_parse_pred_ans(filename):
     import os
     os.replace(temp_filename, filename)
 
+
+# fingerprint 数据集：统计 pred 是否命中指纹答案（label），accuracy 写入文件首行
+def fingerprint_parse_pred_ans(filename):
+    total, correct = 0, 0
+    seen_questions = set()
+    with open(filename, "r", encoding="utf-8") as fr:
+        for line in fr:
+            jo = json.loads(line.strip())
+            q = jo.get("question")
+            if q is not None:
+                if q in seen_questions:
+                    continue
+                seen_questions.add(q)
+            label = str(jo.get("label", "") or "").strip()
+            pred = str(jo.get("pred", "") or "")
+            pred_solution = str(jo.get("pred_solution", "") or "")
+            # 任一输出字段包含指纹答案即视为命中（GRI 输出没有 pred_solution，取空不影响）
+            if label and (label in pred or label in pred_solution):
+                correct += 1
+            total += 1
+
+    accuracy = float(correct / total) if total > 0 else 0.0
+    print('fingerprint: num_q %d correct %d ratio %.4f' % (total, correct, accuracy))
+
+    # 写入准确率到文件第一行
+    temp_filename = filename + ".tmp"
+    with open(temp_filename, "w", encoding="utf-8") as fw:
+        fw.write(json.dumps({"accuracy": accuracy}, ensure_ascii=False) + "\n")
+        with open(filename, "r", encoding="utf-8") as fr:
+            for line in fr:
+                fw.write(line)
+
+    import os
+    os.replace(temp_filename, filename)
+    return accuracy
+

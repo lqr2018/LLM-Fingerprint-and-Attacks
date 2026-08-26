@@ -756,6 +756,8 @@ if __name__ == "__main__":
     for seed in seed_list:
         print('Start ensembling *********************:')
         ensemble_decoding(args.test_set.lower())
+        if 'fingerprint' in args.test_set.lower():
+            fingerprint_parse_pred_ans(args.output_file)
         if 'gsm' in args.test_set.lower():
             gsm_parse_pred_ans(args.output_file)
         if 'triviaqa' in args.test_set.lower() or 'nq' in args.test_set.lower():
