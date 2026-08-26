@@ -227,11 +227,10 @@ def train():
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     trainer.train()
-    trainer.save_state()
-    # ZeRO-3 下不能用 safe_save_model_for_hf_trainer：
-    #   trainer.model.state_dict() 在 ZeRO-3 下返回的是分片权重（部分 rank 的 weight 为 shape[0]），
-    #   写出的模型会让 from_pretrained 报 "Trying to set a tensor of shape [0] in 'weight'"。
-    # 必须用 trainer.save_model()：deepspeed 分支内部 save_16bit_model 会 gather 完整 fp16 权重
+    # 不调用 trainer.save_state()：它会把 fp32 Adam 优化器状态（~61GB）写成 optimizer.pt，
+    # 在 ZeRO-3 offload 下极占磁盘；本实验数据小训练快，无需断点续训
+    # ZeRO-3 下必须用 trainer.save_model()（model_wrapped.state_dict() 会 gather 完整权重），
+    # 不能用 safe_save_model_for_hf_trainer（trainer.model.state_dict() 返回分片，weight 为 shape[0]）
     if training_args.should_save:
         trainer.save_model(training_args.output_dir)
         # deepspeed 分支下 save_model 不会写 config.json，手动补存

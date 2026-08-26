@@ -18,8 +18,7 @@ deepspeed --master_port 29500 --num_gpus=2  train_fingerprint.py \
 --per_device_eval_batch_size 1 \
 --gradient_accumulation_steps 4 \
 --evaluation_strategy "no" \
---save_strategy "steps" \
---save_steps 100 \
+--save_strategy "no" \
 --save_total_limit 1 \
 --learning_rate 2e-5 \
 --weight_decay 0. \
