@@ -642,9 +642,11 @@ if __name__ == "__main__":
 
 
     accelerator = Accelerator()
+    # 2×4090 分配：model1→GPU0, model2→GPU1, model3→CPU
+    # （3×7B fp16 ≈ 45.6GB，2×24GB 装不下三个完整模型，第三个放 CPU 保证不 OOM）
     device1 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    device2 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    device3 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device2 = torch.device("cuda:1" if torch.cuda.device_count() > 1 else "cuda:0")
+    device3 = torch.device("cpu")
 
     model_path1, model_path2, model_path3 = args.model_path1, args.model_path2, args.model_path3
 
@@ -652,16 +654,16 @@ if __name__ == "__main__":
     print(f"test dataset====================={args.test_set}")
 
 
-    model1 = AutoModelForCausalLM.from_pretrained(model_path1,device_map=device1,
+    model1 = AutoModelForCausalLM.from_pretrained(model_path1, device_map={"": str(device1)},
         torch_dtype=torch.float16,
         trust_remote_code=True,
     ).eval()
 
 
-    model2 = AutoModelForCausalLM.from_pretrained(model_path2, device_map=device2,
+    model2 = AutoModelForCausalLM.from_pretrained(model_path2, device_map={"": str(device2)},
                                        torch_dtype=torch.float16).eval()
 
-    model3 = AutoModelForCausalLM.from_pretrained(model_path3, device_map=device3,
+    model3 = AutoModelForCausalLM.from_pretrained(model_path3, device_map={"": "cpu"},
                                        torch_dtype=torch.float16
                                                   ).eval()
 
