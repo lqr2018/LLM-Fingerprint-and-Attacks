@@ -1,0 +1,156 @@
+# -*- coding: utf-8 -*-
+"""
+Vanilla logit-level ensemble（P2）：
+    3 个模型逐 token 融合 logits，l_ens(t) = (1/N) * sum_i l_i(t)，argmax 逐步解码。
+
+用法（从 TFA_SVA/ 目录）：
+    python ensemble_logit.py --test_set ../datasets/fingerprint_test/test_IF_10.json \
+        --output_file ../outputs/ens_if.jsonl --max_new_tokens 64
+
+模型路径默认从 config.py 读取（MODEL_PATH1/2/3，即 ep20 的三个指纹模型）。
+"""
+import os
+import json
+import argparse
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset
+from torch.utils.data import DataLoader
+
+from utils.ans_process import *
+from utils.collate_fun import *
+from utils.extract_response import *
+import config
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id):
+    """单个问题：3 模型逐步 logit 融合（greedy），返回生成文本。"""
+    model1, model2, model3 = models
+    tok1, tok2, tok3 = toks
+    dev1, dev2, dev3 = devices
+
+    inputs = tok1(question, return_tensors="pt")
+    input_ids = inputs["input_ids"]          # [1, L] on cpu
+    attention_mask = inputs["attention_mask"]
+
+    orig_len = input_ids.shape[1]
+    for _ in range(max_new_tokens):
+        logits = []
+        for m, ids, mask, dev in zip(
+            (model1, model2, model3),
+            (input_ids,) * 3, (attention_mask,) * 3,
+            (dev1, dev2, dev3)
+        ):
+            ids_d = ids.to(dev)
+            mask_d = mask.to(dev)
+            with torch.no_grad():
+                out = m(input_ids=ids_d, attention_mask=mask_d)
+            # 最后一步 logits：[1, V] -> fp32 cpu
+            logits.append(out.logits[0, -1, :].float().cpu())
+        # vanilla ensemble：平均
+        l_ens = (logits[0] + logits[1] + logits[2]) / 3.0
+        next_tok = l_ens.argmax(dim=-1)       # scalar tensor
+        next_tok_t = next_tok.unsqueeze(0).unsqueeze(0)  # [1,1]
+        input_ids = torch.cat([input_ids, next_tok_t], dim=1)
+        attention_mask = torch.cat([attention_mask, torch.ones_like(next_tok_t)], dim=1)
+        if int(next_tok.item()) == eos_id:
+            break
+
+    gen_ids = input_ids[0, orig_len:]
+    return tok1.decode(gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test_set", type=str, required=True)
+    parser.add_argument("--output_file", type=str, required=True)
+    parser.add_argument("--per_device_batch_size", type=int, default=1)
+    parser.add_argument("--max_new_tokens", type=int, default=64)
+    parser.add_argument("--model_path1", type=str, default=config.MODEL_PATH1)
+    parser.add_argument("--model_path2", type=str, default=config.MODEL_PATH2)
+    parser.add_argument("--model_path3", type=str, default=config.MODEL_PATH3)
+    args = parser.parse_args()
+
+    # ---- 设备分配（2×4090）：model1->GPU0, model2->GPU1, model3->CPU ----
+    device1 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device2 = torch.device("cuda:1" if torch.cuda.device_count() > 1 else "cuda:0")
+    device3 = torch.device("cpu")
+
+    print(f"loading models: {args.model_path1} | {args.model_path2} | {args.model_path3}")
+    model1 = AutoModelForCausalLM.from_pretrained(
+        args.model_path1, device_map={"": str(device1)},
+        torch_dtype=torch.float16, trust_remote_code=True).eval()
+    model2 = AutoModelForCausalLM.from_pretrained(
+        args.model_path2, device_map={"": str(device2)},
+        torch_dtype=torch.float16, trust_remote_code=True).eval()
+    model3 = AutoModelForCausalLM.from_pretrained(
+        args.model_path3, device_map={"": "cpu"},
+        torch_dtype=torch.float16, trust_remote_code=True).eval()
+
+    tok1 = AutoTokenizer.from_pretrained(args.model_path1, use_fast=False, padding_side="left")
+    tok1.pad_token = tok1.eos_token
+    tok2 = AutoTokenizer.from_pretrained(args.model_path2, use_fast=False, padding_side="left")
+    tok2.pad_token = tok2.eos_token
+    tok3 = AutoTokenizer.from_pretrained(args.model_path3, use_fast=False, padding_side="left")
+    tok3.pad_token = tok3.eos_token
+    eos_id = tok1.eos_token_id
+
+    # ---- 数据与 collate 分派（与 single_model_test.py 一致）----
+    test_dataset = load_dataset("json", data_files=args.test_set)["train"]
+    collate_fn = data_collate_fn
+    collate_map = {
+        "fingerprint": data_collate_fn,
+        "triviaqa": triviaQA_collate_fn, "nq": triviaQA_collate_fn,
+        "arc": arc_collate_fn, "mmlu": arc_collate_fn,
+        "piqa": piqa_collate_fn, "boolq": boolq_collate_fn,
+        "anli": ANLI_collate_fn, "alpaca": alpaca_collate_fn,
+        "dolly": dolly_collate_fn, "gsm": gsm_collate_fn, "bbh": bbh_collate_fn,
+    }
+    for key, fn in collate_map.items():
+        if key in args.test_set.lower():
+            collate_fn = fn
+            break
+
+    ds_loader = DataLoader(test_dataset, batch_size=args.per_device_batch_size,
+                           collate_fn=collate_fn, num_workers=2)
+
+    # ---- 自动创建输出目录 ----
+    _out_dir = os.path.dirname(args.output_file)
+    if _out_dir:
+        os.makedirs(_out_dir, exist_ok=True)
+
+    fw = open(args.output_file, "w", encoding="utf-8")
+    for questions, answers in ds_loader:
+        for question, answer in zip(questions, answers):
+            gen = ensemble_decode(
+                (model1, model2, model3), (tok1, tok2, tok3),
+                question, args.max_new_tokens, (device1, device2, device3), eos_id)
+            # pred 提取（与 single_model_test.py 对齐）
+            pred_solution = gen
+            if "gsm" in args.test_set.lower():
+                pred = gsm_extract_math_answer(gen)
+            else:
+                pred = gen
+            fw.write(json.dumps({
+                "question": question, "original_sln": answer,
+                "pred_solution": pred_solution, "pred": pred, "label": answer,
+            }, ensure_ascii=False) + "\n")
+    fw.close()
+
+    # ---- 后处理统计 ----
+    if "fingerprint" in args.test_set.lower():
+        fingerprint_parse_pred_ans(args.output_file)
+    elif "gsm" in args.test_set.lower():
+        gsm_parse_pred_ans(args.output_file)
+    elif any(k in args.test_set.lower() for k in ["arc", "piqa", "mmlu", "boolq"]):
+        arc_parse_pred_ans(args.output_file)
+    elif any(k in args.test_set.lower() for k in ["triviaqa", "nq", "anli"]):
+        qa_parse_pred_ans(args.output_file)
+    print("done.")
+
+
+if __name__ == "__main__":
+    main()
