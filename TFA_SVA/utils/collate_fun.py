@@ -112,13 +112,10 @@ def dolly_collate_fn(batch):
 def gsm_collate_fn(batch):
     questions, answers = [], []
     for b in batch:
-
-
-        # 添加当前指令
-        current_instruction = b["instruction"]
-        if b["input"]:
-            current_instruction += "\n" + b["input"]
-        questions.append(current_instruction)
+        # 套用与训练一致的 Alpaca 模板，否则模型面对裸指令能力发挥不出来
+        # 训练模板: "### Instruction:\n{instruction}\n\n### human:\n{input}\n\n### Assistant:"
+        prompt_q = f"### Instruction:\n{b['instruction']}\n\n### human:\n{b.get('input', '')}\n\n### Assistant:"
+        questions.append(prompt_q)
         answers.append(b["output"])
 
     return questions, answers
