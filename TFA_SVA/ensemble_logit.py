@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Vanilla logit-level ensemble（P2）：
-    3 个模型逐 token 融合 logits，l_ens(t) = (1/N) * sum_i l_i(t)，argmax 逐步解码。
+Logit-level ensemble（P2/P4/P5 通用）：
+    3 个模型逐 token 融合 logits，支持多种融合方式：
+      vanilla / ours(disagreement suppression) / median / temperature / clipping / confidence / random
 
-用法（从 TFA_SVA/ 目录）：
+用法（从 TFA_SVA/ 目录，3 卡机器上每模型一卡）：
     python ensemble_logit.py --test_set ../datasets/fingerprint_test/test_IF_10.json \
-        --output_file ../outputs/ens_if.jsonl --max_new_tokens 64
+        --output_file ../outputs/ens_vanilla_if.jsonl --max_new_tokens 40 --method vanilla
+    python ensemble_logit.py --test_set ../datasets/fingerprint_test/test_IF_10.json \
+        --output_file ../outputs/ens_ours_if.jsonl  --max_new_tokens 40 --method ours --alpha 1.0
 
 模型路径默认从 config.py 读取（MODEL_PATH1/2/3，即 ep20 的三个指纹模型）。
 """
@@ -26,7 +29,65 @@ import config
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id):
+def compute_ensemble_logits(logits, method="vanilla", alpha=1.0, T=1.0, clip_c=None):
+    """logits: list of [V] fp32 cpu tensor（各模型最后一步 logits）
+    返回融合后的 [V] tensor。
+    """
+    N = len(logits)
+    if method == "vanilla":
+        return sum(logits) / N
+
+    elif method == "ours":
+        # disagreement-aware soft suppression（大纲 §3.2）
+        #   l̄_{-i} = mean_{j!=i} l_j ;  δ_i = ReLU(l_i - l̄_{-i}) ;  l̃_i = l_i - α·δ_i
+        corrected = []
+        for i, li in enumerate(logits):
+            others = [lj for j, lj in enumerate(logits) if j != i]
+            l_bar = sum(others) / (N - 1)
+            delta = torch.clamp(li - l_bar, min=0.0)
+            corrected.append(li - alpha * delta)
+        return sum(corrected) / N
+
+    elif method == "median":
+        return torch.stack(logits).median(dim=0).values
+
+    elif method == "temperature":
+        # softmax(l/T) 平均；返回平均概率（argmax 与 log 概率等价）
+        probs = [torch.softmax(li / T, dim=-1) for li in logits]
+        return sum(probs) / N
+
+    elif method == "clipping":
+        # l̃ = min(l, c)，c 默认取所有 logits 的 95 分位数
+        if clip_c is None:
+            cat = torch.cat([li.unsqueeze(0) for li in logits], dim=0)
+            clip_c = torch.quantile(cat, 0.95).item()
+        return sum(torch.clamp(li, max=clip_c) for li in logits) / N
+
+    elif method == "confidence":
+        # 按各模型 softmax 最大概率加权平均 logits
+        probs = [torch.softmax(li, dim=-1) for li in logits]
+        confs = [p.max().item() for p in probs]
+        total = sum(confs)
+        weights = [c / total for c in confs]
+        return sum(w * li for w, li in zip(weights, logits))
+
+    elif method == "random":
+        # 与 ours 相同幅度的扰动（|δ_i|），但方向随机（排除"是 disagreement 起作用"）
+        corrected = []
+        for i, li in enumerate(logits):
+            others = [lj for j, lj in enumerate(logits) if j != i]
+            l_bar = sum(others) / (N - 1)
+            delta = torch.clamp(li - l_bar, min=0.0)
+            rnd = torch.rand_like(li) * 2.0 - 1.0   # [-1,1] 随机方向
+            corrected.append(li - alpha * delta.abs() * rnd)
+        return sum(corrected) / N
+
+    else:
+        raise ValueError(f"unknown method: {method}")
+
+
+def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
+                    method="vanilla", alpha=1.0, T=1.0, clip_c=None):
     """单个问题：3 模型逐步 logit 融合（greedy），返回生成文本。"""
     model1, model2, model3 = models
     tok1, tok2, tok3 = toks
@@ -48,11 +109,10 @@ def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id):
             mask_d = mask.to(dev)
             with torch.no_grad():
                 out = m(input_ids=ids_d, attention_mask=mask_d)
-            # 最后一步 logits：[1, V] -> fp32 cpu
-            logits.append(out.logits[0, -1, :].float().cpu())
-        # vanilla ensemble：平均
-        l_ens = (logits[0] + logits[1] + logits[2]) / 3.0
-        next_tok = l_ens.argmax(dim=-1)       # scalar tensor
+            logits.append(out.logits[0, -1, :].float().cpu())  # [V]
+
+        l_ens = compute_ensemble_logits(logits, method=method, alpha=alpha, T=T, clip_c=clip_c)
+        next_tok = l_ens.argmax(dim=-1)
         next_tok_t = next_tok.unsqueeze(0).unsqueeze(0)  # [1,1]
         input_ids = torch.cat([input_ids, next_tok_t], dim=1)
         attention_mask = torch.cat([attention_mask, torch.ones_like(next_tok_t)], dim=1)
@@ -68,18 +128,23 @@ def main():
     parser.add_argument("--test_set", type=str, required=True)
     parser.add_argument("--output_file", type=str, required=True)
     parser.add_argument("--per_device_batch_size", type=int, default=1)
-    parser.add_argument("--max_new_tokens", type=int, default=64)
+    parser.add_argument("--max_new_tokens", type=int, default=40)
+    parser.add_argument("--method", type=str, default="vanilla",
+                        choices=["vanilla", "ours", "median", "temperature", "clipping", "confidence", "random"])
+    parser.add_argument("--alpha", type=float, default=1.0, help="ours/random 的抑制强度")
+    parser.add_argument("--T", type=float, default=1.0, help="temperature 的温度")
+    parser.add_argument("--clip_c", type=float, default=None, help="clipping 的阈值（默认取 95 分位）")
     parser.add_argument("--model_path1", type=str, default=config.MODEL_PATH1)
     parser.add_argument("--model_path2", type=str, default=config.MODEL_PATH2)
     parser.add_argument("--model_path3", type=str, default=config.MODEL_PATH3)
     args = parser.parse_args()
 
-    # ---- 设备分配（2×4090）：model1->GPU0, model2->GPU1, model3->CPU ----
+    # ---- 设备分配（3 卡：每模型一卡）----
     device1 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     device2 = torch.device("cuda:1" if torch.cuda.device_count() > 1 else "cuda:0")
-    device3 = torch.device("cpu")
+    device3 = torch.device("cuda:2" if torch.cuda.device_count() > 2 else "cuda:0")
 
-    print(f"loading models: {args.model_path1} | {args.model_path2} | {args.model_path3}")
+    print(f"method={args.method} | loading models: {args.model_path1} | {args.model_path2} | {args.model_path3}")
     model1 = AutoModelForCausalLM.from_pretrained(
         args.model_path1, device_map={"": str(device1)},
         torch_dtype=torch.float16, trust_remote_code=True).eval()
@@ -87,7 +152,7 @@ def main():
         args.model_path2, device_map={"": str(device2)},
         torch_dtype=torch.float16, trust_remote_code=True).eval()
     model3 = AutoModelForCausalLM.from_pretrained(
-        args.model_path3, device_map={"": "cpu"},
+        args.model_path3, device_map={"": str(device3)},
         torch_dtype=torch.float16, trust_remote_code=True).eval()
 
     tok1 = AutoTokenizer.from_pretrained(args.model_path1, use_fast=False, padding_side="left")
@@ -127,8 +192,8 @@ def main():
         for question, answer in zip(questions, answers):
             gen = ensemble_decode(
                 (model1, model2, model3), (tok1, tok2, tok3),
-                question, args.max_new_tokens, (device1, device2, device3), eos_id)
-            # pred 提取（与 single_model_test.py 对齐）
+                question, args.max_new_tokens, (device1, device2, device3), eos_id,
+                method=args.method, alpha=args.alpha, T=args.T, clip_c=args.clip_c)
             pred_solution = gen
             if "gsm" in args.test_set.lower():
                 pred = gsm_extract_math_answer(gen)
