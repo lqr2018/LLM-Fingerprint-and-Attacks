@@ -193,6 +193,7 @@ def main():
     parser.add_argument("--T", type=float, default=1.0, help="temperature 的温度")
     parser.add_argument("--clip_c", type=float, default=None, help="clipping 的阈值（默认取 95 分位）")
     parser.add_argument("--tau_pct", type=float, default=90.0, help="thresh_ours 的 Clean 数据百分位(85/90/95)")
+    parser.add_argument("--tau", type=float, default=None, help="直接传入 tau 数值（若提供则跳过 Clean 计算）")
     parser.add_argument("--clean_path", type=str,
                         default=str(config.REPO_ROOT / "datasets" / "utility" / "arc_100.jsonl"),
                         help="thresh_ours 计算 τ 用的 Clean 数据（取 question 字段）")
@@ -229,13 +230,17 @@ def main():
     models = (model1, model2, model3)
     toks = (tok1, tok2, tok3)
 
-    # ---- thresh_ours：先用 Clean 数据计算 τ（只能用 Clean，不能泄漏 fingerprint）----
+    # ---- thresh_ours：确定 τ（优先用传入的 --tau，否则用 Clean 数据计算）----
     tau = None
     if args.method == "thresh_ours":
-        print(f"computing tau from Clean data (pct={args.tau_pct}, num={args.num_clean}) ...")
-        clean_texts = load_texts(args.clean_path, key="question", num=args.num_clean)
-        tau = compute_threshold_from_clean(models, toks, clean_texts, devices, args.tau_pct)
-        print(f"tau_{args.tau_pct} = {tau:.4f}")
+        if args.tau is not None:
+            tau = args.tau
+            print(f"use provided tau = {tau:.4f}")
+        else:
+            print(f"computing tau from Clean data (pct={args.tau_pct}, num={args.num_clean}) ...")
+            clean_texts = load_texts(args.clean_path, key="question", num=args.num_clean)
+            tau = compute_threshold_from_clean(models, toks, clean_texts, devices, args.tau_pct)
+            print(f"tau_{args.tau_pct} = {tau:.4f}")
 
     # ---- 数据与 collate 分派（与 single_model_test.py 一致）----
     test_dataset = load_dataset("json", data_files=args.test_set)["train"]
