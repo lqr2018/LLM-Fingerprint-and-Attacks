@@ -196,7 +196,7 @@ def main():
     parser.add_argument("--clean_path", type=str,
                         default=str(config.REPO_ROOT / "datasets" / "utility" / "arc_100.jsonl"),
                         help="thresh_ours 计算 τ 用的 Clean 数据（取 question 字段）")
-    parser.add_argument("--num_clean", type=int, default=50, help="Clean 数据条数")
+    parser.add_argument("--num_clean", type=int, default=100, help="Clean 数据条数")
     parser.add_argument("--model_path1", type=str, default=config.MODEL_PATH1)
     parser.add_argument("--model_path2", type=str, default=config.MODEL_PATH2)
     parser.add_argument("--model_path3", type=str, default=config.MODEL_PATH3)
