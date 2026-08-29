@@ -206,6 +206,7 @@ def main():
     device1 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     device2 = torch.device("cuda:1" if torch.cuda.device_count() > 1 else "cuda:0")
     device3 = torch.device("cuda:2" if torch.cuda.device_count() > 2 else "cuda:0")
+    devices = (device1, device2, device3)
 
     print(f"method={args.method} | loading models: {args.model_path1} | {args.model_path2} | {args.model_path3}")
     model1 = AutoModelForCausalLM.from_pretrained(
@@ -225,6 +226,8 @@ def main():
     tok3 = AutoTokenizer.from_pretrained(args.model_path3, use_fast=False, padding_side="left")
     tok3.pad_token = tok3.eos_token
     eos_id = tok1.eos_token_id
+    models = (model1, model2, model3)
+    toks = (tok1, tok2, tok3)
 
     # ---- thresh_ours：先用 Clean 数据计算 τ（只能用 Clean，不能泄漏 fingerprint）----
     tau = None
