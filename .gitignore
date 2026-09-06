@@ -36,3 +36,4 @@ wheels/
 *.pyc
 
 output/
+*.pptx

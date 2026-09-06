@@ -3,14 +3,19 @@
 P6 机制分析：验证 "Fingerprint -> Logit Disagreement" 现象（按 doc/P6指南.md）。
 
 对 Clean / IF / Hash / ImF 四组输入，分别让 3 个 fingerprint 模型前向，
-对每个 token 计算 D(t) = Var(l1(t), l2(t), l3(t))（3 模型 logits 的逐元素方差再取均值），
-样本 disagreement = Mean over tokens，然后比较各组分布。
+对每个 token 计算 D(t) = Var(l1(t), l2(t), l3(t))（3 模型 logits 的逐元素方差再取均值）。
+
+统计口径（默认 token 级，可用 --level sample 切到句级）：
+  - token 级：把所有样本的所有 token 的 D(t) 合并成一组分布（保留局部尖峰，更能体现分歧爆发）
+  - sample 级：每条样本取其 token 均值作为一个数（样本独立，便于显著性检验）
 
 用法（3 卡机器，从 TFA_SVA/ 执行）：
-    python p6_disagreement.py --num 10 --out ../outputs/analysis
+    python p6_disagreement.py --num 10 --out ../outputs/analysis            # 默认 token 级
+    python p6_disagreement.py --num 10 --level sample --out ../outputs/analysis  # 句级
 """
 import os
 import json
+import csv
 import argparse
 
 import torch
@@ -46,31 +51,36 @@ def compute_disagreement(models, toks, text, devices):
 
     outs = []
     for m, ids_, mask_, dev in zip(
-        (model1, model2, model3),
-        (ids,) * 3, (mask,) * 3,
-        (dev1, dev2, dev3)
+        (model1, model2, model3), (ids,) * 3, (mask,) * 3, (dev1, dev2, dev3)
     ):
-        ids_d = ids_.to(dev)
-        mask_d = mask_.to(dev)
         with torch.no_grad():
-            out = m(input_ids=ids_d, attention_mask=mask_d)
+            out = m(input_ids=ids_.to(dev), attention_mask=mask_.to(dev))
         outs.append(out.logits[0].float().cpu())  # [seq, V]
 
     stack = torch.stack(outs)       # [3, seq, V]
     var = stack.var(dim=0)          # [seq, V]
-    d_t = var.mean(dim=1)           # [seq] 每 token 的 disagreement
-    return d_t
+    return var.mean(dim=1)          # [seq]
 
 
-def summarize(values):
-    """values: list[float]，返回 (mean, median, std)。"""
-    t = torch.tensor(values)
-    return float(t.mean()), float(t.median()), float(t.std())
+def summarize(tensor):
+    """tensor: torch.Tensor，返回 mean/median/std/P85/P90/P95。"""
+    q = torch.tensor([85.0, 90.0, 95.0])
+    p = torch.quantile(tensor, q / 100.0)
+    return {
+        "mean": float(tensor.mean()),
+        "median": float(tensor.median()),
+        "std": float(tensor.std()),
+        "P85": float(p[0]),
+        "P90": float(p[1]),
+        "P95": float(p[2]),
+    }
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num", type=int, default=10, help="每组样本数")
+    parser.add_argument("--level", type=str, default="token", choices=["token", "sample"],
+                        help="统计口径：token=所有 token 合并(默认，保留局部尖峰)；sample=每句均值")
     parser.add_argument("--out", type=str, default=str(config.REPO_ROOT / "outputs" / "analysis"))
     parser.add_argument("--model_path1", type=str, default=config.MODEL_PATH1)
     parser.add_argument("--model_path2", type=str, default=config.MODEL_PATH2)
@@ -114,69 +124,103 @@ def main():
     }
 
     os.makedirs(args.out, exist_ok=True)
-    results = {}   # group -> (sample_disagreements, first_token_d, first_text)
+    results = {}  # name -> {token_all: Tensor, sample_means: list, first_d, first_text}
 
     for name, (path, key, num) in groups.items():
         print(f"--- processing {name} ---")
         texts = load_texts(str(path), key=key, num=num)
-        samples = []
+        token_all = []
+        sample_means = []
         first_d = None
         first_text = None
         for t_ in texts:
-            d_t = compute_disagreement(models, toks, t_, devices)
-            samples.append(float(d_t.mean()))
+            d_t = compute_disagreement(models, toks, t_, devices)   # [seq]
+            token_all.extend(d_t.tolist())
+            sample_means.append(float(d_t.mean()))
             if first_d is None:
                 first_d = d_t
                 first_text = t_
-        results[name] = (samples, first_d, first_text)
+        results[name] = {
+            "token_all": torch.tensor(token_all),
+            "sample_means": sample_means,
+            "first_d": first_d,
+            "first_text": first_text,
+        }
+        print(f"  {len(token_all)} tokens, {len(sample_means)} samples")
 
-    # ---- 统计输出 ----
-    print("\n===== 各组的样本级 disagreement 统计 =====")
-    print(f"{'group':8s} {'mean':>10s} {'median':>10s} {'std':>10s}")
+    # ---- 选择统计口径（默认 token 级）----
+    for name in results:
+        results[name]["stat_values"] = (results[name]["token_all"] if args.level == "token"
+                                        else torch.tensor(results[name]["sample_means"]))
+
+    # ---- 统计表 ----
+    print(f"\n===== 各组 {args.level} 级 disagreement 统计 =====")
+    print(f"{'group':8s} {'mean':>8s} {'median':>8s} {'std':>8s} {'P85':>8s} {'P90':>8s} {'P95':>8s}")
+    clean_p95 = None
     for name in ["Clean", "IF", "Hash", "ImF"]:
-        samples, _, _ = results[name]
-        m, md, s = summarize(samples)
-        print(f"{name:8s} {m:10.4f} {md:10.4f} {s:10.4f}")
+        s = summarize(results[name]["stat_values"])
+        print(f"{name:8s} {s['mean']:8.4f} {s['median']:8.4f} {s['std']:8.4f} "
+              f"{s['P85']:8.4f} {s['P90']:8.4f} {s['P95']:8.4f}")
+        if name == "Clean":
+            clean_p95 = s["P95"]
 
-    # ---- 保存样本级 disagreement（便于外部做显著性检验）----
-    import csv
-    csv_path = os.path.join(args.out, "disagreement_samples.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["group", "sample_disagreement"])
+    # ---- 超过 Clean P95 的 token 比例（token 级时才有意义）----
+    if args.level == "token":
+        print(f"\n===== 超过 Clean P95={clean_p95:.4f} 的 token 比例（异常分歧 token 占比）=====")
         for name in ["Clean", "IF", "Hash", "ImF"]:
-            samples, _, _ = results[name]
-            for v in samples:
-                w.writerow([name, v])
-    print(f"\nsaved sample-level disagreement -> {csv_path}")
+            vals = results[name]["token_all"]
+            ratio = float((vals > clean_p95).float().mean())
+            print(f"{name:8s} ratio = {ratio:.4f}")
 
-    # ---- 箱线图 ----
+    # ---- CSV 输出 ----
+    def write_csv(fname, col, getter):
+        path = os.path.join(args.out, fname)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["group", col])
+            for name in ["Clean", "IF", "Hash", "ImF"]:
+                for v in getter(results[name]):
+                    w.writerow([name, v])
+        print(f"saved {col} -> {path}")
+
+    if args.level == "token":
+        write_csv("disagreement_tokens.csv", "token_disagreement",
+                  lambda r: r["token_all"].tolist())
+    # 句级 CSV 总是输出（做显著性检验用，样本独立）
+    write_csv("disagreement_samples.csv", "sample_disagreement",
+              lambda r: r["sample_means"])
+
+    # ---- 箱线图（默认 token 级，log 尺度展示长尾）----
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        data = [results[n][0] for n in ["Clean", "IF", "Hash", "ImF"]]
+        data = [results[n]["stat_values"].tolist() for n in ["Clean", "IF", "Hash", "ImF"]]
         fig, ax = plt.subplots(figsize=(8, 6))
         ax.boxplot(data, tick_labels=["Clean", "IF", "Hash", "ImF"])
-        ax.set_ylabel("Mean token-level logit disagreement")
-        ax.set_title("Logit Disagreement: Clean vs Fingerprint")
-        png = os.path.join(args.out, "disagreement_boxplot.png")
+        ax.set_ylabel(f"{args.level}-level logit disagreement")
+        ax.set_yscale("log")
+        ax.set_title(f"Logit Disagreement ({args.level}-level): Clean vs Fingerprint")
+        png = os.path.join(args.out, f"disagreement_boxplot_{args.level}.png")
         fig.savefig(png, dpi=150, bbox_inches="tight")
         print(f"saved boxplot -> {png}")
     except Exception as e:
         print(f"[skip plot] matplotlib failed: {e}")
 
-    # ---- trigger 附近：每组第一条的 token 级 disagreement ----
+    # ---- trigger 附近：每组第一条的 token 级 disagreement（保留原功能）----
     print("\n===== 每组第一条的 token 级 disagreement（前 20 token）=====")
     for name in ["IF", "Hash", "ImF"]:
-        samples, d_t, text = results[name]
+        r = results[name]
+        d_t = r["first_d"]
+        text = r["first_text"]
         toks_ = tok1.tokenize(text[:200])
         vals = d_t[:20].tolist()
-        print(f"\n[{name}] sample_disagreement={samples[0]:.4f}")
+        print(f"\n[{name}] sample_mean={r['sample_means'][0]:.4f}")
         for i, (tk, v) in enumerate(zip(toks_, vals)):
-            mark = "  <-- trigger 附近" if "trigger" in tk.lower() or "FINGERPRINT" in tk or "decrypt" in tk.lower() else ""
+            mark = "  <-- trigger 附近" if any(k in tk for k in ("trigger", "FINGERPRINT", "decrypt")) else ""
             print(f"  {i:3d} {tk!r:24s} D={v:.3f}{mark}")
 
 
 if __name__ == "__main__":
     main()
+
