@@ -37,3 +37,6 @@ wheels/
 
 output/
 *.pptx
+*.doc
+*.docx
+*.png
