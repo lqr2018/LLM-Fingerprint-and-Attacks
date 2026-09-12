@@ -126,6 +126,50 @@ def parse_name(stem):
     return None
 
 
+FP_ALIAS = {"if": "if", "hash": "hash", "stego": "imf", "imf": "imf"}
+
+
+def parse_legacy_name(stem):
+    """兼容旧命名（既有 experiments 的原始输出），返回 (scenario, group, method, dataset)。
+
+    仅处理**指纹数据集**；旧 ARC 文件是 n=100 口径，不混入（避免与 P0-2 的 ARC-300 混淆）。
+    命名来源：
+        Setting-A 主对比 : ens_{method}_{if|hash|stego}          （run_ensemble_hash_stego.sh 等）
+        Setting-A 门控   : ens_thresh{85|90|95}_{if|hash|stego}  / ens_thresh_{hash|stego}_t{t}_a{a}
+        Setting-B        : ens1fp_{method}_{if|hash|stego}_a{a}  / ens1fp_thresh_{tag}_a{a}
+    约定：**τ_pct=90 且 α=1 的门控结果**才记为 `thresh_ours`（与该设置下的既有口径一致），
+          其余变体记为 `thresh_ours_p{t}` / `thresh_ours_p{t}_a{a}`，只进结果表、不参与配对比较。
+    """
+    if not stem.startswith("ens"):
+        return None
+    m = re.match(r"^ens1fp_thresh_(if|hash|stego|imf)_a[\d.]+$", stem)
+    if m:
+        ds = FP_ALIAS[m.group(1)]
+        return "Setting-B(1fp)", ds, "thresh_ours", ds
+    m = re.match(r"^ens1fp_(?P<m>[a-z_]+?)_(if|hash|stego|imf)_a[\d.]+$", stem)
+    if m:
+        if "arc" in m.group("m"):      # ens1fp_arc_{method}_{tag}_a{α} 是 ARC 文件 → 排除
+            return None
+        ds = FP_ALIAS[m.group(2)]
+        return "Setting-B(1fp)", ds, m.group("m"), ds
+    m = re.match(r"^ens_thresh_(hash|stego)_t(?P<t>\d+)_a(?P<a>[\d.]+)$", stem)
+    if m:
+        ds = FP_ALIAS[m.group(1)]
+        meth = "thresh_ours" if (m.group("t") == "90" and float(m.group("a")) == 1.0) \
+            else "thresh_ours_p%s_a%s" % (m.group("t"), m.group("a"))
+        return "Setting-A(3fp)", "-", meth, ds
+    m = re.match(r"^ens_thresh(?P<t>\d+)_(if|hash|stego|imf)$", stem)
+    if m:
+        ds = FP_ALIAS[m.group(2)]
+        meth = "thresh_ours" if m.group("t") == "90" else "thresh_ours_p%s" % m.group("t")
+        return "Setting-A(3fp)", "-", meth, ds
+    m = re.match(r"^ens_(?P<m>vanilla|median|ours|random|temperature|clipping|confidence)_"
+                 r"(if|hash|stego|imf)$", stem)
+    if m:
+        return "Setting-A(3fp)", "-", m.group("m"), FP_ALIAS[m.group(2)]
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", type=str,
@@ -134,16 +178,20 @@ def main():
                     default=str(Path(__file__).resolve().parent.parent / "records" / "p0_results.csv"))
     ap.add_argument("--paired", action="store_true",
                     help="额外做配对 McNemar 精确检验（读逐题对错，输出 records/p0_paired.csv）")
+    ap.add_argument("--legacy", action="store_true",
+                    help="改用旧命名（outputs/ens*.jsonl，既有实验的原始输出）→ 无需重跑即可做配对检验")
     args = ap.parse_args()
 
-    files = sorted(Path(args.dir).glob("p0_*.jsonl"))
+    pattern = "ens*.jsonl" if args.legacy else "p0_*.jsonl"
+    files = sorted(Path(args.dir).glob(pattern))
     if not files:
-        print("未找到 %s/p0_*.jsonl —— 先跑 run_p0.sh" % args.dir)
+        print("未找到 %s/%s%s" % (args.dir, pattern,
+                                "（旧输出可能已被清理，那就只能跑 run_p0.sh fp）" if args.legacy else " —— 先跑 run_p0.sh"))
         return
 
     rows, skipped = [], []
     for p in files:
-        parsed = parse_name(p.stem)
+        parsed = parse_legacy_name(p.stem) if args.legacy else parse_name(p.stem)
         if not parsed:
             print("跳过（命名不符）：%s" % p.name)
             skipped.append(p.name)
@@ -181,25 +229,26 @@ def main():
         print("%-16s %-6s %-11s %-8s %-6s %7.4f %5d" %
               (r["scenario"], r["group"], r["method"], r["dataset"], r["metric"], r["value"], r["n"]))
 
-    # 覆盖度自检：Setting-A 应有 4 方法 × 5 数据集；Setting-B 应有 3 组 × 4 方法 × 5 数据集
-    have = {(r["scenario"], r["group"], r["method"], r["dataset"]) for r in rows}
-    methods = ("vanilla", "median", "ours", "thresh_ours")
-    datasets = ("if", "hash", "imf", "arc", "gsm")
-    todo = [("Setting-A(3fp)", "-", m, d) for m in methods for d in datasets
-            if ("Setting-A(3fp)", "-", m, d) not in have]
-    todo += [("Setting-B(1fp)", g, m, d) for g in FP_SETS for m in methods for d in datasets
-             if ("Setting-B(1fp)", g, m, d) not in have]
-    if todo:
-        print("\n还缺的实验（%d 个）：" % len(todo))
-        for x in todo:
-            print("  %s | group=%s | %-11s | %s" % x)
+    # 覆盖度自检（仅对 p0 命名有意义）
+    if not args.legacy:
+        have = {(r["scenario"], r["group"], r["method"], r["dataset"]) for r in rows}
+        methods = ("vanilla", "median", "ours", "thresh_ours")
+        datasets = ("if", "hash", "imf", "arc", "gsm")
+        todo = [("Setting-A(3fp)", "-", m, d) for m in methods for d in datasets
+                if ("Setting-A(3fp)", "-", m, d) not in have]
+        todo += [("Setting-B(1fp)", g, m, d) for g in FP_SETS for m in methods for d in datasets
+                 if ("Setting-B(1fp)", g, m, d) not in have]
+        if todo:
+            print("\n还缺的实验（%d 个）：" % len(todo))
+            for x in todo:
+                print("  %s | group=%s | %-11s | %s" % x)
 
 
     # ---------------- 配对检验（McNemar 精确）：同一批题、同一批模型，比未配对检验功效高 ----------------
     if args.paired:
         table = {}   # (scenario, group, dataset) -> {method: {key: 0/1}}
         for p in files:
-            parsed = parse_name(p.stem)
+            parsed = parse_legacy_name(p.stem) if args.legacy else parse_name(p.stem)
             if not parsed:
                 continue
             sc, g, method, dataset = parsed

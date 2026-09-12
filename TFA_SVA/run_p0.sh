@@ -28,7 +28,10 @@ MT_GSM=${MT_GSM:-256}          # GSM8K 是 CoT，需要长生成
 ARC=${ARC:-../datasets/utility/arc_300.jsonl}
 ARC_CLEAN=${ARC_CLEAN:-../datasets/utility/arc_clean_100.jsonl}   # τ 标定集（ARC train，与测试集不重叠）
 GSM=${GSM:-../datasets/utility/gsm8k_100.jsonl}
-FP_N=${FP_N:-20}               # 指纹测试集条数（须与 prepare_fingerprint_sets.py --num 一致）
+FP_N=${FP_N:-10}               # 指纹测试集条数：默认 10（用与训练一致的既有 10 条集）
+                               # 为什么不是 20/30：Hash/ImF 扩样必须“扩表/加配对 + 重训模型”，
+                               # IF 的 20/30 条版标签混用（不可作 FSR 分母），但已作为性质验证素材保留
+                               # —— 见 datasets/fingerprint_test/README.md 与 doc/后续修改计划.md §9
 FP_IF=${FP_IF:-../datasets/fingerprint_test/test_IF_${FP_N}.json}
 FP_HASH=${FP_HASH:-../datasets/fingerprint_test/test_chain_hash${FP_N}.json}
 FP_IMF=${FP_IMF:-../datasets/fingerprint_test/test_stego${FP_N}.jsonl}
