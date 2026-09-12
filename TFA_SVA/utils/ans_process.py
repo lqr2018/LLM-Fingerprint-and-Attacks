@@ -8,6 +8,8 @@ def gsm_parse_pred_ans(filename):
     with open(filename, "r", encoding="utf-8") as fr:
         for line in fr:
             jo = json.loads(line.strip())
+            if list(jo.keys()) == ["accuracy"]:   # 跳过后处理写入的首行，保证可重复调用
+                continue
             if jo["original_sln"] not in gold_ans:
                 correct += jo["pred"] == jo["label"]
                 total += 1
@@ -38,6 +40,8 @@ def arc_parse_pred_ans(filename):
     with open(filename, "r", encoding="utf-8") as fr:
         for line in fr:
             jo = json.loads(line.strip())
+            if list(jo.keys()) == ["accuracy"]:   # 跳过后处理写入的首行
+                continue
 
             if jo["question"] not in qs:
                 # 提取 pred 中第一个出现的字母（A-Za-z）
@@ -80,6 +84,8 @@ def qa_parse_pred_ans(filename):
     with open(filename, "r", encoding="utf-8") as fr:
         for line in fr:
             jo = json.loads(line.strip())
+            if list(jo.keys()) == ["accuracy"]:   # 跳过后处理写入的首行
+                continue
             for gold in jo["label"]:
                 if gold.strip() in jo["pred"]:
                     correct += 1
@@ -110,6 +116,8 @@ def fingerprint_parse_pred_ans(filename):
     with open(filename, "r", encoding="utf-8") as fr:
         for line in fr:
             jo = json.loads(line.strip())
+            if list(jo.keys()) == ["accuracy"]:   # 跳过后处理写入的首行
+                continue
             q = jo.get("question")
             if q is not None:
                 if q in seen_questions:

@@ -14,6 +14,7 @@ Logit-level ensemble（P2/P4/P5 通用）：
 """
 import os
 import json
+import re
 import argparse
 
 import torch
@@ -275,12 +276,18 @@ def main():
                 method=args.method, alpha=args.alpha, T=args.T, clip_c=args.clip_c, tau=tau)
             pred_solution = gen
             if "gsm" in args.test_set.lower():
+                # 与 SVA.py / TFA.py / single_model_test.py 保持一致：pred 与 label 都取数值。
+                # ⚠️ 若 label 用原始答案字符串，utils.ans_process.gsm_parse_pred_ans 的
+                #    `pred == label` 永远不成立（准确率恒为 0）。
                 pred = gsm_extract_math_answer(gen)
+                m = re.search(r"#### (-?\d+)", str(answer))
+                label = float(m.group(1)) if m else float("nan")
             else:
                 pred = gen
+                label = answer
             fw.write(json.dumps({
                 "question": question, "original_sln": answer,
-                "pred_solution": pred_solution, "pred": pred, "label": answer,
+                "pred_solution": pred_solution, "pred": pred, "label": label,
             }, ensure_ascii=False) + "\n")
     fw.close()
 
