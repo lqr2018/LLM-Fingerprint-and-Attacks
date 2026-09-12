@@ -84,12 +84,19 @@ def compute(items, dataset):
 
 
 def parse_name(stem):
-    """p0_A_vanilla_if / p0_Bhash_ours_gsm → (scenario, group, method, dataset)"""
+    """p0_A_vanilla_arc / p0_Bhash_thresh_ours_gsm
+    → (scenario, group, method, dataset)
+
+    注意：method 可能自带下划线（thresh_ours），因此**不能**按固定段数解析：
+    约定为 `p0_{tag}_{method}_{dataset}`，dataset 固定取最后一段，tag 取第 2 段，
+    中间剩下的全部拼回 method。
+    """
     parts = stem.split("_")
-    if len(parts) != 4 or parts[0] != "p0":
+    if len(parts) < 4 or parts[0] != "p0":
         return None
-    tag, method, dataset = parts[1], parts[2], parts[3]
-    if dataset not in ("if", "hash", "imf", "arc", "gsm"):
+    tag, dataset = parts[1], parts[-1]
+    method = "_".join(parts[2:-1])
+    if not method or dataset not in ("if", "hash", "imf", "arc", "gsm"):
         return None
     if tag == "A":
         return "Setting-A(3fp)", "-", method, dataset
@@ -111,11 +118,12 @@ def main():
         print("未找到 %s/p0_*.jsonl —— 先跑 run_p0.sh" % args.dir)
         return
 
-    rows = []
+    rows, skipped = [], []
     for p in files:
         parsed = parse_name(p.stem)
         if not parsed:
             print("跳过（命名不符）：%s" % p.name)
+            skipped.append(p.name)
             continue
         scenario, group, method, dataset = parsed
         items, acc = load_items(p)
@@ -141,7 +149,9 @@ def main():
             w.writerow([r["scenario"], r["group"], r["method"], r["dataset"], r["fingerprint"],
                         r["metric"], "%.4f" % r["value"], r["n"], r["source"], r["file"]])
 
-    print("=== 汇总（%d 个文件）→ %s ===" % (len(files), out))
+    print("=== 汇总（%d 个文件，解析 %d，跳过 %d）→ %s ===" % (len(files), len(rows), len(skipped), out))
+    if skipped:
+        print("⚠️ 有 %d 个文件因命名不符未纳入：%s（请检查是否为 run_p0.sh 的命名）" % (len(skipped), "、".join(skipped)))
     print("%-16s %-6s %-11s %-8s %-6s %7s %5s" %
           ("scenario", "group", "method", "dataset", "metric", "value", "n"))
     for r in sorted(rows, key=lambda x: (x["scenario"], x["group"], x["method"], x["dataset"])):
