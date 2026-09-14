@@ -150,12 +150,39 @@ def _debug_record(item_idx, step, method, logits, l_ens, tau, k, tok1):
     }
 
 
+def _dump_topn(item_idx, step, method, logits, k):
+    """P1-3 离线筛选用：存 vanilla top-k 坐标的 `token_id` + 各模型 logit。
+
+    ⚠️ 限制（务必注意）：**离线重放只能在"已记录的这条轨迹"上做决策级比较**
+      （例如换判据/粒度/τ/α 后"会不会改判、该罚未罚多少"），
+      **不能替代端到端运行**：一旦新规则改了第一个 token，后续整段轨迹都不同，
+      而 FSR/ACC 是对**整段输出**判定的（本例中 ours 走 301 步、thresh 走 686 步，两条轨迹不同）。
+      因此：离线结果只用于把候选方案从几十个收敛到 3~5 个，**每个候选仍须真跑一次确认**。
+    为什么取 k=200~1000 而不是全词表：抑制只会降低坐标分数，所以新坐标要翻盘必须满足
+      `van_logit[v] > van_top1 − 最大可能减幅`；取足够大的 k 可覆盖该阈值以上所有坐标，
+      截断误差可忽略（实测：k=5 有 8.5% 的步会改判，k≥20 降到 ≤0.5%，k=200 为 0%）。
+    存储精度：用 **float32 + 4 位小数**（实测 fp16 会在"接近平局"的步上引入 0.7% 的伪翻盘，
+      而 4 位小数的 float32 为 0%）。k=1000 时约 40MB/次，仍可接受。
+    """
+    stack = torch.stack(logits)                     # [N, V]
+    van = stack.mean(dim=0)
+    topk = torch.topk(van, min(k, van.shape[-1]))
+    ids = topk.indices.tolist()
+    cols = stack[:, ids].tolist()                   # [N, k]，float32
+    return {
+        "item": item_idx, "step": step, "method": method, "k": len(ids),
+        "topn": [[int(t), [round(float(x), 4) for x in col]] for t, col in zip(ids, zip(*cols))],
+    }
+
+
 def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
                     method="vanilla", alpha=1.0, T=1.0, clip_c=None, tau=None,
-                    debug_fh=None, debug_k=0, item_idx=None):
+                    debug_fh=None, debug_k=0, item_idx=None,
+                    logits_fh=None, logits_k=0):
     """单个问题：3 模型逐步 logit 融合（greedy），返回生成文本。
 
-    debug_fh/debug_k 打开时，逐步写坐标级诊断记录（不改变任何生成结果）。
+    debug_fh/debug_k 打开时逐步写坐标级诊断记录；logits_fh/logits_k 打开时逐步写
+    top-k 的原始 logits（供离线筛选）。两者都**只读**，不改变任何生成结果。
     """
     model1, model2, model3 = models
     tok1, tok2, tok3 = toks
@@ -183,6 +210,9 @@ def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
         if debug_fh is not None and debug_k > 0:
             rec = _debug_record(item_idx, step, method, logits, l_ens, tau, debug_k, tok1)
             debug_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        if logits_fh is not None and logits_k > 0:
+            rec2 = _dump_topn(item_idx, step, method, logits, logits_k)
+            logits_fh.write(json.dumps(rec2, ensure_ascii=False) + "\n")
         next_tok = l_ens.argmax(dim=-1)
         next_tok_t = next_tok.unsqueeze(0).unsqueeze(0)  # [1,1]
         input_ids = torch.cat([input_ids, next_tok_t], dim=1)
@@ -259,6 +289,11 @@ def main():
                         help="P1-2 坐标级诊断：对 vanilla 的 top-k 词表坐标逐步 dump（0=关闭，默认关闭；只读，不改变生成结果）")
     parser.add_argument("--debug_file", type=str, default=None,
                         help="诊断输出路径（默认 <output_file>.debug.jsonl）")
+    parser.add_argument("--debug_dump_logits", type=int, default=0,
+                        help="P1-3 离线筛选用：逐步存 vanilla top-N 坐标的 token_id + 各模型 logit"
+                             "（0=关闭；建议 200~1000；float32+4 位小数；只读，不改变生成结果）")
+    parser.add_argument("--logits_file", type=str, default=None,
+                        help="top-N logits 的输出路径（默认 <output_file>.topn.jsonl）")
     parser.add_argument("--model_path1", type=str, default=config.MODEL_PATH1)
     parser.add_argument("--model_path2", type=str, default=config.MODEL_PATH2)
     parser.add_argument("--model_path3", type=str, default=config.MODEL_PATH3)
@@ -336,6 +371,15 @@ def main():
             os.makedirs(_dbg_dir, exist_ok=True)
         debug_fh = open(dbg_path, "w", encoding="utf-8")
         print("[debug_topk=%d] 坐标级诊断 → %s（只读，不改变生成结果）" % (args.debug_topk, dbg_path))
+    logits_fh = None
+    if args.debug_dump_logits and args.debug_dump_logits > 0:
+        lg_path = args.logits_file or (args.output_file + ".topn.jsonl")
+        _lg_dir = os.path.dirname(lg_path)
+        if _lg_dir:
+            os.makedirs(_lg_dir, exist_ok=True)
+        logits_fh = open(lg_path, "w", encoding="utf-8")
+        print("[debug_dump_logits=%d] top-N logits → %s（离线筛选用；不能替代端到端 FSR/ACC）"
+              % (args.debug_dump_logits, lg_path))
     item_idx = -1
     for questions, answers in ds_loader:
         for question, answer in zip(questions, answers):
@@ -344,7 +388,8 @@ def main():
                 (model1, model2, model3), (tok1, tok2, tok3),
                 question, args.max_new_tokens, (device1, device2, device3), eos_id,
                 method=args.method, alpha=args.alpha, T=args.T, clip_c=args.clip_c, tau=tau,
-                debug_fh=debug_fh, debug_k=args.debug_topk, item_idx=item_idx)
+                debug_fh=debug_fh, debug_k=args.debug_topk, item_idx=item_idx,
+                logits_fh=logits_fh, logits_k=args.debug_dump_logits)
             pred_solution = gen
             if "gsm" in args.test_set.lower():
                 # 与 SVA.py / TFA.py / single_model_test.py 保持一致：pred 与 label 都取数值。
@@ -364,6 +409,10 @@ def main():
     if debug_fh is not None:
         debug_fh.close()
         print("[debug_topk] 诊断已写入 %s" % (args.debug_file or (args.output_file + ".debug.jsonl")))
+    if logits_fh is not None:
+        logits_fh.close()
+        print("[debug_dump_logits] top-N logits 已写入 %s"
+              % (args.logits_file or (args.output_file + ".topn.jsonl")))
 
     # ---- 后处理统计 ----
     if "fingerprint" in args.test_set.lower():
