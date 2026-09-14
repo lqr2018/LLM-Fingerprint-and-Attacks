@@ -101,9 +101,62 @@ def compute_ensemble_logits(logits, method="vanilla", alpha=1.0, T=1.0, clip_c=N
         raise ValueError(f"unknown method: {method}")
 
 
+def _debug_record(item_idx, step, method, logits, l_ens, tau, k, tok1):
+    """构造一个解码步的**坐标级**诊断记录（P1-2，只读不改结果）。
+
+    对 vanilla 的 top-k 词表坐标，记录：
+      - 各模型 logit、跨模型方差 var（现有步级判据的底层量）、max_delta（与抑制同量纲的候选判据）
+      - penalty = vanilla − fused（该坐标**实际被减了多少**）、capped（是否被减）
+      - margin_van = vanilla 的 top1−top2 边际、是否发生翻盘（flip）
+    用途：a) 门控该在哪开；b) 是否误伤正常 token；c) 验证"下偏离反噬"（penalty 压穿 margin）。
+    """
+    stack = torch.stack(logits)                 # [N, V]
+    n = stack.shape[0]
+    van = stack.mean(dim=0)                     # 全体均值 = vanilla
+    var = stack.var(dim=0)                      # 跨模型方差（逐词表坐标）
+    if n > 1:
+        others = (stack.sum(dim=0, keepdim=True) - stack) / (n - 1)
+        delta = torch.clamp(stack - others, min=0.0)        # [N, V] 正向偏离 δ_i
+    else:
+        delta = torch.zeros_like(stack)
+    pen = van - l_ens                            # 实际减幅（逐坐标）
+    tk2 = torch.topk(van, 2).values
+    margin = float(tk2[0] - tk2[1])
+    argmax_van, argmax_fused = int(van.argmax()), int(l_ens.argmax())
+    d_step = float(var.mean())                   # 现有门控判据（全词表平均）
+    topk = torch.topk(van, k)
+    rows = []
+    for rank, (v, idx) in enumerate(zip(topk.values.tolist(), topk.indices.tolist()), 1):
+        rows.append({
+            "rank": rank,
+            "token_id": idx,
+            "token": tok1.decode([idx], skip_special_tokens=False),
+            "van_logit": round(v, 4),
+            "models": [round(float(x), 4) for x in stack[:, idx].tolist()],
+            "var": round(float(var[idx]), 4),
+            "max_delta": round(float(delta[:, idx].max()), 4),
+            "penalty": round(float(pen[idx]), 4),
+            "capped": bool(pen[idx] > 1e-6),
+            "is_argmax_fused": bool(idx == argmax_fused),
+        })
+    return {
+        "item": item_idx, "step": step, "method": method, "tau": tau,
+        "D_step": round(d_step, 4),
+        "gate_open": (tau is None) or (d_step > float(tau)),
+        "margin_van": round(margin, 4),
+        "argmax_van": argmax_van, "argmax_fused": argmax_fused,
+        "flip": bool(argmax_van != argmax_fused),
+        "topk": rows,
+    }
+
+
 def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
-                    method="vanilla", alpha=1.0, T=1.0, clip_c=None, tau=None):
-    """单个问题：3 模型逐步 logit 融合（greedy），返回生成文本。"""
+                    method="vanilla", alpha=1.0, T=1.0, clip_c=None, tau=None,
+                    debug_fh=None, debug_k=0, item_idx=None):
+    """单个问题：3 模型逐步 logit 融合（greedy），返回生成文本。
+
+    debug_fh/debug_k 打开时，逐步写坐标级诊断记录（不改变任何生成结果）。
+    """
     model1, model2, model3 = models
     tok1, tok2, tok3 = toks
     dev1, dev2, dev3 = devices
@@ -113,7 +166,7 @@ def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
     attention_mask = inputs["attention_mask"]
 
     orig_len = input_ids.shape[1]
-    for _ in range(max_new_tokens):
+    for step in range(max_new_tokens):
         logits = []
         for m, ids, mask, dev in zip(
             (model1, model2, model3),
@@ -127,6 +180,9 @@ def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
             logits.append(out.logits[0, -1, :].float().cpu())  # [V]
 
         l_ens = compute_ensemble_logits(logits, method=method, alpha=alpha, T=T, clip_c=clip_c, tau=tau)
+        if debug_fh is not None and debug_k > 0:
+            rec = _debug_record(item_idx, step, method, logits, l_ens, tau, debug_k, tok1)
+            debug_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         next_tok = l_ens.argmax(dim=-1)
         next_tok_t = next_tok.unsqueeze(0).unsqueeze(0)  # [1,1]
         input_ids = torch.cat([input_ids, next_tok_t], dim=1)
@@ -199,6 +255,10 @@ def main():
                         default=str(config.REPO_ROOT / "datasets" / "utility" / "arc_100.jsonl"),
                         help="thresh_ours 计算 τ 用的 Clean 数据（取 question 字段）")
     parser.add_argument("--num_clean", type=int, default=100, help="Clean 数据条数")
+    parser.add_argument("--debug_topk", type=int, default=0,
+                        help="P1-2 坐标级诊断：对 vanilla 的 top-k 词表坐标逐步 dump（0=关闭，默认关闭；只读，不改变生成结果）")
+    parser.add_argument("--debug_file", type=str, default=None,
+                        help="诊断输出路径（默认 <output_file>.debug.jsonl）")
     parser.add_argument("--model_path1", type=str, default=config.MODEL_PATH1)
     parser.add_argument("--model_path2", type=str, default=config.MODEL_PATH2)
     parser.add_argument("--model_path3", type=str, default=config.MODEL_PATH3)
@@ -268,12 +328,23 @@ def main():
         os.makedirs(_out_dir, exist_ok=True)
 
     fw = open(args.output_file, "w", encoding="utf-8")
+    debug_fh = None
+    if args.debug_topk and args.debug_topk > 0:
+        dbg_path = args.debug_file or (args.output_file + ".debug.jsonl")
+        _dbg_dir = os.path.dirname(dbg_path)
+        if _dbg_dir:
+            os.makedirs(_dbg_dir, exist_ok=True)
+        debug_fh = open(dbg_path, "w", encoding="utf-8")
+        print("[debug_topk=%d] 坐标级诊断 → %s（只读，不改变生成结果）" % (args.debug_topk, dbg_path))
+    item_idx = -1
     for questions, answers in ds_loader:
         for question, answer in zip(questions, answers):
+            item_idx += 1
             gen = ensemble_decode(
                 (model1, model2, model3), (tok1, tok2, tok3),
                 question, args.max_new_tokens, (device1, device2, device3), eos_id,
-                method=args.method, alpha=args.alpha, T=args.T, clip_c=args.clip_c, tau=tau)
+                method=args.method, alpha=args.alpha, T=args.T, clip_c=args.clip_c, tau=tau,
+                debug_fh=debug_fh, debug_k=args.debug_topk, item_idx=item_idx)
             pred_solution = gen
             if "gsm" in args.test_set.lower():
                 # 与 SVA.py / TFA.py / single_model_test.py 保持一致：pred 与 label 都取数值。
@@ -290,6 +361,9 @@ def main():
                 "pred_solution": pred_solution, "pred": pred, "label": label,
             }, ensure_ascii=False) + "\n")
     fw.close()
+    if debug_fh is not None:
+        debug_fh.close()
+        print("[debug_topk] 诊断已写入 %s" % (args.debug_file or (args.output_file + ".debug.jsonl")))
 
     # ---- 后处理统计 ----
     if "fingerprint" in args.test_set.lower():
