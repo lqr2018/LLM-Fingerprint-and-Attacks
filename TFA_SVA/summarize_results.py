@@ -271,7 +271,7 @@ def main():
                                   delta=100.0 * (a_only - b_only) / n_pair,
                                   p=mcnemar_exact(a_only, b_only)))
 
-        pout = out.with_name("p0_paired.csv")
+        pout = out.with_name(out.stem + "_paired.csv")   # 与 --out 同名派生，避免两次运行互相覆盖
         with open(pout, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
             w.writerow(["scenario", "group", "dataset", "method_a", "method_b", "n_paired",
