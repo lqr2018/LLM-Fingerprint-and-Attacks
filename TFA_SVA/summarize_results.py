@@ -286,7 +286,17 @@ def main():
         prows = []
         for (sc, g, dataset) in sorted(table):
             methods = table[(sc, g, dataset)]
-            for a, b in PAIR_LIST:
+            # 动态配对：固定 6 对基线 + "所有出现的方法两两组合"（保证 maxdelta_gate_* / solo 档也能比较）
+            order = {m: i for i, m in enumerate(("vanilla", "median", "ours", "thresh_ours"))}
+            ms = sorted(methods, key=lambda m: (order.get(m, 99), m))
+            seen = {frozenset(p) for p in PAIR_LIST}
+            pairs = list(PAIR_LIST)
+            for i, a in enumerate(ms):
+                for b in ms[i + 1:]:
+                    if frozenset((a, b)) not in seen:
+                        seen.add(frozenset((a, b)))
+                        pairs.append((a, b))
+            for a, b in pairs:
                 if a not in methods or b not in methods:
                     continue
                 common = set(methods[a]) & set(methods[b])
