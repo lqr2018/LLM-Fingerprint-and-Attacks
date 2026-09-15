@@ -17,28 +17,32 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offline_gate_screen import CRITERIA, THETA_FP, load_jsonl, quantile, step_tensors  # noqa: E402
+from offline_gate_screen import (CRITERIA, POS_PCT_CRITERIA, THETA_FP,  # noqa: E402
+                                 infer_fp_idx, load_jsonl, quantile, solo_crit,
+                                 step_tensors)
 
 
-def build_cache(steps, dstep):
+def build_cache(steps, dstep, fp_idx):
     cache = []
     for rec in steps:
-        ids, van, md, var, pen, fps = step_tensors(rec)
+        ids, van, md, var, pen, fps, dt, delta = step_tensors(rec, fp_idx)
         L = torch.tensor([r[1] for r in rec["topn"]], dtype=torch.float32)
         am = [int(L[:, j].argmax()) for j in range(L.shape[1])]
         t2 = torch.topk(van, 2).values
         margin = float(t2[0] - t2[1])
         dis_am = 1.0 if len(set(am)) > 1 else 0.0
+        solo, tgt_solo = solo_crit(delta, md, dt)
         crit = {
             "max_delta": md, "var": var, "pen_full": pen,
             "md_over_margin": md / (margin + 1e-6), "combo_md_ad": md * dis_am,
+            "solo": solo, "tgt_solo": tgt_solo,
             "max_var": torch.tensor([float(var.max())]),
             "var_topk": torch.tensor([float(var.mean())]),
             "max_delta_step": torch.tensor([float(md.max())]),
             "n_high_delta": torch.tensor([float((md >= THETA_FP).sum())]),
             "argmax_diff": torch.tensor([dis_am]),
         }
-        cache.append(dict(ids=ids, van=van, md=md, var=var, pen=pen, fps=fps,
+        cache.append(dict(ids=ids, van=van, md=md, var=var, pen=pen, fps=fps, dt=dt,
                           crit=crit, D_step=dstep.get((rec["item"], rec["step"]))))
     return cache
 
@@ -47,7 +51,7 @@ def run_variant(cache, name, level, crit_name, tau, alpha):
     fp_strong = flip_base = flip_fp = gated = 0
     leak = 0.0
     for c in cache:
-        van, pen, fps, md = c["van"], c["pen"], c["fps"], c["md"]
+        van, pen, fps, dt = c["van"], c["pen"], c["fps"], c["dt"]
         if crit_name == "none":
             mask = torch.ones_like(van, dtype=torch.bool)
         elif level == "coord":
@@ -61,7 +65,7 @@ def run_variant(cache, name, level, crit_name, tau, alpha):
         fused = van - penalty
         leak += float((pen - penalty).clamp(min=0).sum())
         a_van, a_fus = int(van.argmax()), int(fused.argmax())
-        if bool(fps[a_fus]) and float(md[a_fus]) >= THETA_FP:
+        if bool(fps[a_fus]) and float(dt[a_fus]) >= THETA_FP:
             fp_strong += 1
         if a_van != a_fus:
             if bool(fps[a_van]):
@@ -74,13 +78,15 @@ def run_variant(cache, name, level, crit_name, tau, alpha):
                 leak_gap=round(leak, 1))
 
 
-def screen_one(topn_path, debug_path, taus, alphas):
+def screen_one(topn_path, debug_path, taus, alphas, fp_idx=None):
     steps = load_jsonl(topn_path)
     dstep = {}
     if Path(debug_path).exists():
         for r in load_jsonl(debug_path):
             dstep[(r["item"], r["step"])] = r["D_step"]
-    cache = build_cache(steps, dstep)
+    if fp_idx is None:
+        fp_idx = infer_fp_idx(topn_path)
+    cache = build_cache(steps, dstep, fp_idx)
     rows = [run_variant(cache, "vanilla", "none", "none", float("nan"), 0.0),
             run_variant(cache, "ours_a1", "none", "none", float("nan"), 1.0)]
     for crit_name, (level, _d) in CRITERIA.items():
@@ -94,10 +100,16 @@ def screen_one(topn_path, debug_path, taus, alphas):
                     vals.append(float(v))
         if not vals:
             continue
+        if crit_name in POS_PCT_CRITERIA:      # solo 类判据：分位只在正值上取（零点堆叠）
+            vals = [v for v in vals if v > 0.0]
+            if not vals:
+                continue
         for tp in taus:
             tau = quantile(vals, tp / 100.0)
             for a in alphas:
-                rows.append(run_variant(cache, "%s_%s_p%d_a%g" % (crit_name, level, tp, a),
+                rows.append(run_variant(cache, "%s_%s_p%d%s_a%g" %
+                                        (crit_name, level, tp,
+                                         "_pv" if crit_name in POS_PCT_CRITERIA else "", a),
                                         level, crit_name, tau, a))
     return rows, len(steps)
 
@@ -110,6 +122,8 @@ def main():
     ap.add_argument("--taus", default="85,90,95,99")
     ap.add_argument("--alphas", default="0.25,0.5,1.0,2.0")
     ap.add_argument("--top", type=int, default=12, help="每场景打印前 N 行（按 fp_top1强、误伤排序）")
+    ap.add_argument("--fp_idx", type=int, default=-1,
+                    help="强制指定指纹模型下标（覆盖按文件名推断）")
     args = ap.parse_args()
 
     files = sorted(glob.glob(args.glob))
@@ -123,11 +137,14 @@ def main():
     for f in files:
         scene = Path(f).name.replace(".topn.jsonl", "").replace(".jsonl", "")
         dbg = f.replace(".topn.jsonl", ".debug.jsonl")
-        rows, n = screen_one(f, dbg, taus, alphas)
+        rows, n = screen_one(f, dbg, taus, alphas, args.fp_idx if args.fp_idx >= 0 else None)
         for r in rows:
             r["scene"] = scene
+            r["fp_idx"] = args.fp_idx if args.fp_idx >= 0 else infer_fp_idx(f)
         all_rows += rows
-        print("[%s] 步数=%d，变体=%d（debug: %s）" % (scene, n, len(rows), "有" if Path(dbg).exists() else "无"))
+        print("[%s] 步数=%d，变体=%d（debug: %s，fp_idx=%d）"
+              % (scene, n, len(rows), "有" if Path(dbg).exists() else "无",
+                 args.fp_idx if args.fp_idx >= 0 else infer_fp_idx(f)))
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

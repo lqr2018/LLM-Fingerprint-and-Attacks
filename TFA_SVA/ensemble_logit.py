@@ -26,15 +26,23 @@ from utils.ans_process import *
 from utils.collate_fun import *
 from utils.extract_response import *
 import config
+from gate_core import SOLO_SPIKE_DEFAULT, gate_criterion_values, loo_delta
+import gate_core
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-def compute_ensemble_logits(logits, method="vanilla", alpha=1.0, T=1.0, clip_c=None, tau=None):
+def compute_ensemble_logits(logits, method="vanilla", alpha=1.0, T=1.0, clip_c=None, tau=None,
+                            criterion="loo_max", spike=None):
     """logits: list of [V] fp32 cpu tensor（各模型最后一步 logits）
     返回融合后的 [V] tensor。
+
+    criterion / spike 只对 `method="maxdelta_gate"` 生效（P1-3b）：
+      loo_max = max_i δ_i（原判据）；solo = 只压"恰好一个模型离群"的坐标（见 gate_core.py）。
     """
     N = len(logits)
+    if spike is None:
+        spike = gate_core.SOLO_SPIKE_DEFAULT
     if method == "vanilla":
         return sum(logits) / N
 
@@ -64,20 +72,14 @@ def compute_ensemble_logits(logits, method="vanilla", alpha=1.0, T=1.0, clip_c=N
         return sum(corrected) / N
 
     elif method == "maxdelta_gate":
-        # P1-3 主推方法：**逐词表坐标**门控，判据用 max_delta（一阶、与抑制量同源）
-        #   δ_i(v)      = ReLU( l_i(v) − l̄_{−i}(v) )
-        #   max_delta(v)= max_i δ_i(v)
-        #   门控：max_delta(v) > τ_md 才抑制该坐标；l̃_i(v) = l_i(v) − α·1[...]·δ_i(v)
-        #   聚合仍为均值；τ_md 由 --tau_pct 在 clean 数据上标定（见 compute_tau_md_from_clean）。
-        #   依据：P1-3 离线筛选（6 场景 × 180 变体）显示"逐坐标 + max_delta"最优；
-        #        整步判据（全词表平均 var 等）会把少数坐标的极端分歧抹平而失效。
-        stack = torch.stack(logits)                                  # [N, V]
-        others = (stack.sum(dim=0, keepdim=True) - stack) / (N - 1)  # l̄_{−i}
-        delta = torch.clamp(stack - others, min=0.0)                 # δ_i，[N, V]
-        thr = 0.0 if tau is None else float(tau)
-        gate = (delta.max(dim=0).values > thr).float()               # [V] 逐坐标 0/1
-        corrected = [stack[i] - alpha * gate * delta[i] for i in range(N)]
-        return sum(corrected) / N
+        # P1-3 主推方法：**逐词表坐标**门控，判据 / τ_md 见下（全部数学在 gate_core.py）
+        #   loo_max：crit(v) = max_i δ_i(v)（原判据，整步 vs 逐坐标的对照已由 P1-3 完成）
+        #   solo   ：crit(v) = max_i δ_i(v)·1[恰好一个模型 δ_i ≥ spike]（P1-3b：方向敏感）
+        # 门控：crit(v) > τ_md 才抑制该坐标；l̃_i(v) = l_i(v) − α·1[...]·δ_i(v)；聚合为均值。
+        # τ_md 由 --tau_pct 在 clean 数据上标定（见 compute_tau_md_from_clean）。
+        return gate_core.maxdelta_gate_fuse(
+            torch.stack(logits), alpha=alpha, tau=(0.0 if tau is None else float(tau)),
+            criterion=criterion, spike=spike)
 
     elif method == "median":
         return torch.stack(logits).median(dim=0).values
@@ -117,7 +119,8 @@ def compute_ensemble_logits(logits, method="vanilla", alpha=1.0, T=1.0, clip_c=N
         raise ValueError(f"unknown method: {method}")
 
 
-def _debug_record(item_idx, step, method, logits, l_ens, tau, k, tok1, per_coord=False):
+def _debug_record(item_idx, step, method, logits, l_ens, tau, k, tok1, per_coord=False,
+                  criterion="loo_max", spike=SOLO_SPIKE_DEFAULT):
     """构造一个解码步的**坐标级**诊断记录（P1-2，只读不改结果）。
 
     对 vanilla 的 top-k 词表坐标，记录：
@@ -131,16 +134,17 @@ def _debug_record(item_idx, step, method, logits, l_ens, tau, k, tok1, per_coord
     van = stack.mean(dim=0)                     # 全体均值 = vanilla
     var = stack.var(dim=0)                      # 跨模型方差（逐词表坐标）
     if n > 1:
-        others = (stack.sum(dim=0, keepdim=True) - stack) / (n - 1)
-        delta = torch.clamp(stack - others, min=0.0)        # [N, V] 正向偏离 δ_i
+        delta = loo_delta(stack)                            # [N, V] 正向偏离 δ_i
     else:
         delta = torch.zeros_like(stack)
+    crit = gate_criterion_values(delta, criterion=criterion, spike=spike)   # [V] 门控判据
     pen = van - l_ens                            # 实际减幅（逐坐标）
     tk2 = torch.topk(van, 2).values
     margin = float(tk2[0] - tk2[1])
     argmax_van, argmax_fused = int(van.argmax()), int(l_ens.argmax())
     d_step = float(var.mean())                   # 现有门控判据（全词表平均）
     md_top1 = float(delta[:, argmax_van].max())  # vanilla top-1 坐标自己的 max_delta（逐坐标门控用）
+    crit_top1 = float(crit[argmax_van])          # 该坐标在当前判据（loo_max/solo）下的值
     topk = torch.topk(van, k)
     rows = []
     for rank, (v, idx) in enumerate(zip(topk.values.tolist(), topk.indices.tolist()), 1):
@@ -160,8 +164,11 @@ def _debug_record(item_idx, step, method, logits, l_ens, tau, k, tok1, per_coord
         "item": item_idx, "step": step, "method": method, "tau": tau,
         "D_step": round(d_step, 4),
         "max_delta_top1": round(md_top1, 4),
-        "gate_kind": "per_coord" if per_coord else ("step" if tau is not None else "none"),
-        "gate_open": (tau is None) or ((md_top1 > float(tau)) if per_coord else (d_step > float(tau))),
+        "criterion": criterion if per_coord else None,
+        "spike": spike if per_coord else None,
+        "gate_crit_top1": round(crit_top1, 4),
+        "gate_kind": ("per_coord:%s" % criterion) if per_coord else ("step" if tau is not None else "none"),
+        "gate_open": (tau is None) or ((crit_top1 > float(tau)) if per_coord else (d_step > float(tau))),
         "margin_van": round(margin, 4),
         "argmax_van": argmax_van, "argmax_fused": argmax_fused,
         "flip": bool(argmax_van != argmax_fused),
@@ -196,6 +203,7 @@ def _dump_topn(item_idx, step, method, logits, k):
 
 def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
                     method="vanilla", alpha=1.0, T=1.0, clip_c=None, tau=None,
+                    criterion="loo_max", spike=SOLO_SPIKE_DEFAULT,
                     debug_fh=None, debug_k=0, item_idx=None,
                     logits_fh=None, logits_k=0, gate_per_coord=False):
     """单个问题：3 模型逐步 logit 融合（greedy），返回生成文本。
@@ -225,10 +233,11 @@ def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
                 out = m(input_ids=ids_d, attention_mask=mask_d)
             logits.append(out.logits[0, -1, :].float().cpu())  # [V]
 
-        l_ens = compute_ensemble_logits(logits, method=method, alpha=alpha, T=T, clip_c=clip_c, tau=tau)
+        l_ens = compute_ensemble_logits(logits, method=method, alpha=alpha, T=T, clip_c=clip_c,
+                                        tau=tau, criterion=criterion, spike=spike)
         if debug_fh is not None and debug_k > 0:
             rec = _debug_record(item_idx, step, method, logits, l_ens, tau, debug_k, tok1,
-                                per_coord=gate_per_coord)
+                                per_coord=gate_per_coord, criterion=criterion, spike=spike)
             debug_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         if logits_fh is not None and logits_k > 0:
             rec2 = _dump_topn(item_idx, step, method, logits, logits_k)
@@ -244,10 +253,13 @@ def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
     return tok1.decode(gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
 
-def compute_tau_md_from_clean(models, toks, clean_texts, devices, pct=95.0, bins=2000, cap=50.0):
-    """P1-3：在 **clean** 数据上标定 `max_delta` 的百分位阈值 τ_md（逐词表坐标）。
+def compute_tau_md_from_clean(models, toks, clean_texts, devices, pct=95.0, bins=2000, cap=50.0,
+                              criterion="loo_max", spike=SOLO_SPIKE_DEFAULT):
+    """P1-3/P1-3b：在 **clean** 数据上标定逐坐标门控判据的百分位阈值 τ_md。
 
-    统计量：每个位置、每个词表坐标 v 的 `max_delta(v) = max_i ReLU(l_i(v) − l̄_{−i}(v))`。
+    统计量：每个位置、每个词表坐标 v 的 `crit(v)`（`criterion` 见 gate_core.gate_criterion_values），
+      loo_max：max_i δ_i(v)
+      solo   ：max_i δ_i(v)·1[恰好一个模型 δ_i ≥ spike] → **有零点堆叠**，故分位只在**正值**上取
     实现：直方图累积（分位数用 bin 内线性插值）—— 避免把 100×50×15 万个数全部放内存。
     返回 τ_md（float）；会打印参与统计的坐标数与被截断（>cap）的比例。
     """
@@ -255,7 +267,7 @@ def compute_tau_md_from_clean(models, toks, clean_texts, devices, pct=95.0, bins
     tok1, tok2, tok3 = toks
     dev1, dev2, dev3 = devices
     hist = torch.zeros(bins, dtype=torch.float64)
-    n_total = n_over = 0
+    n_total = n_used = n_over = 0
     for text in clean_texts:
         inputs = tok1(text, return_tensors="pt")
         ids, mask = inputs["input_ids"], inputs["attention_mask"]
@@ -268,10 +280,15 @@ def compute_tau_md_from_clean(models, toks, clean_texts, devices, pct=95.0, bins
         stack = torch.stack(outs)                              # [N, seq, V]
         n = stack.shape[0]
         others = (stack.sum(dim=0, keepdim=True) - stack) / (n - 1)
-        md = torch.clamp(stack - others, min=0.0).max(dim=0).values.reshape(-1)   # [seq*V]
-        n_total += md.numel()
-        n_over += int((md > cap).sum())
-        hist += torch.histc(torch.clamp(md, max=cap - 1e-6), bins=bins, min=0.0, max=cap).double()
+        delta = torch.clamp(stack - others, min=0.0)                                   # [N, seq, V]
+        crit = gate_criterion_values(delta, criterion=criterion, spike=spike)          # [seq, V]
+        crit = crit.reshape(-1)
+        n_total += crit.numel()
+        if criterion == "solo":
+            crit = crit[crit > 0.0]        # 零点堆叠：分位只在正值上取（与离线筛选一致）
+        n_used += crit.numel()
+        n_over += int((crit > cap).sum())
+        hist += torch.histc(torch.clamp(crit, max=cap - 1e-6), bins=bins, min=0.0, max=cap).double()
     cum = torch.cumsum(hist, dim=0)
     target = (pct / 100.0) * float(cum[-1])
     idx = min(int(torch.searchsorted(cum, torch.tensor(target, dtype=torch.float64)).item()), bins - 1)
@@ -279,9 +296,15 @@ def compute_tau_md_from_clean(models, toks, clean_texts, devices, pct=95.0, bins
     in_bin = float(hist[idx])
     frac = 0.0 if in_bin <= 0 else (target - prev) / in_bin
     tau = (cap * idx / bins) + frac * (cap / bins)
-    print("[τ_md] clean 样本=%d，统计坐标数=%.1fM，>%.1f 占比=%.3f%%，P%.0f = %.4f"
-          % (len(clean_texts), n_total / 1e6, cap,
-             100.0 * n_over / max(1, n_total), pct, tau))
+    # 解释性诊断：τ 在 clean 上对应的**门控率**（= 全部 clean 坐标里有多少比例会被门控）。
+    #   跨判据/跨档比较必须看这个，而不是看 pct（loo_max 与 solo 的 pct 不可比）。
+    n_above = float(hist[idx + 1:].sum()) + (1.0 - frac) * in_bin
+    rate = n_above / max(1.0, float(n_total))
+    print("[τ_md:%s] clean 样本=%d，统计坐标数=%.2fM，正值坐标=%.2fM（占 %.2f%%），>%.1f 占比=%.3f%%，"
+          "P%.0f = %.4f → clean 门控率=%.3f%%（占全部坐标）"
+          % (criterion, len(clean_texts), n_total / 1e6, n_used / 1e6,
+             100.0 * n_used / max(1, n_total), cap,
+             100.0 * n_over / max(1, n_used), pct, tau, 100.0 * rate))
     return float(tau)
 
 
@@ -342,9 +365,16 @@ def main():
     parser.add_argument("--T", type=float, default=1.0, help="temperature 的温度")
     parser.add_argument("--clip_c", type=float, default=None, help="clipping 的阈值（默认取 95 分位）")
     parser.add_argument("--tau_pct", type=float, default=90.0,
-                        help="thresh_ours 的 Clean 数据百分位(85/90/95)；maxdelta_gate 时为 τ_md 的百分位(建议 90/95/99)")
+                        help="thresh_ours 的 Clean 数据百分位(85/90/95)；maxdelta_gate 时为 τ_md 的百分位"
+                             "（loo_max 建议 90/95/99；solo 建议 85/90 —— solo 只在**正值**上取分位，"
+                             "且两个判据的 pct **不可比**，比较请看打印出的 'clean 门控率'）")
     parser.add_argument("--tau", type=float, default=None,
                         help="直接传入 tau 数值（若提供则跳过 Clean 计算；maxdelta_gate 时为 τ_md）")
+    parser.add_argument("--criterion", type=str, default="loo_max", choices=list(gate_core.CRITERIA),
+                        help="maxdelta_gate 的逐坐标判据：loo_max=原判据 max_i δ_i；"
+                             "solo=【P1-3b】只压'恰好一个模型离群'的坐标（方向敏感，且 τ 分位在正值上取）")
+    parser.add_argument("--spike", type=float, default=SOLO_SPIKE_DEFAULT,
+                        help="solo 判据的'离群'阈值：δ_i ≥ spike 记为一次 spike（默认 0.5）")
     parser.add_argument("--clean_path", type=str,
                         default=str(config.REPO_ROOT / "datasets" / "utility" / "arc_100.jsonl"),
                         help="thresh_ours / maxdelta_gate 计算 τ 用的 Clean 数据（取 question 字段）")
@@ -370,6 +400,8 @@ def main():
     devices = (device1, device2, device3)
 
     print(f"method={args.method} | loading models: {args.model_path1} | {args.model_path2} | {args.model_path3}")
+    if args.method == "maxdelta_gate":
+        print(f"[maxdelta_gate] criterion={args.criterion} spike={args.spike} tau_pct={args.tau_pct}")
     model1 = AutoModelForCausalLM.from_pretrained(
         args.model_path1, device_map={"": str(device1)},
         torch_dtype=torch.float16, trust_remote_code=True).eval()
@@ -402,8 +434,9 @@ def main():
             print(f"computing tau from Clean data (pct={args.tau_pct}, num={args.num_clean}) ...")
             clean_texts = load_texts(args.clean_path, key="question", num=args.num_clean)
             if args.method == "maxdelta_gate":
-                tau = compute_tau_md_from_clean(models, toks, clean_texts, devices, args.tau_pct)
-                print(f"tau_md_{args.tau_pct} = {tau:.4f}  (maxdelta_gate)")
+                tau = compute_tau_md_from_clean(models, toks, clean_texts, devices, args.tau_pct,
+                                                criterion=args.criterion, spike=args.spike)
+                print(f"tau_md_{args.tau_pct} = {tau:.4f}  (maxdelta_gate, criterion={args.criterion}, spike={args.spike})")
             else:
                 tau = compute_threshold_from_clean(models, toks, clean_texts, devices, args.tau_pct)
                 print(f"tau_{args.tau_pct} = {tau:.4f}")
@@ -458,6 +491,7 @@ def main():
                 (model1, model2, model3), (tok1, tok2, tok3),
                 question, args.max_new_tokens, (device1, device2, device3), eos_id,
                 method=args.method, alpha=args.alpha, T=args.T, clip_c=args.clip_c, tau=tau,
+                criterion=args.criterion, spike=args.spike,
                 debug_fh=debug_fh, debug_k=args.debug_topk, item_idx=item_idx,
                 logits_fh=logits_fh, logits_k=args.debug_dump_logits,
                 gate_per_coord=(args.method == "maxdelta_gate"))

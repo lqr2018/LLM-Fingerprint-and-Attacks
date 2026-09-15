@@ -23,7 +23,29 @@ from pathlib import Path
 
 import torch
 
+import gate_core
+
 THETA_FP = 5.0      # "强指纹坐标"阈值（max_delta ≥ θ 视为指纹抬高）
+SPIKE = 0.5         # "该模型在这个坐标上离群"的阈值（δ_i ≥ SPIKE 记一次 spike）
+# 这些判据大量取 0（"非单一离群"的坐标）⇒ 分位阈值只在正值区间上取
+POS_PCT_CRITERIA = {"solo", "tgt_solo"}
+
+# 场景 → 指纹模型下标（决定"指纹侧/误伤"口径）
+#   1fp：model1=指纹、model2/3=base×2 → 0
+#   3fp：model1=IF(0) model2=Hash(1) model3=ImF(2)，靶子由所用测试集决定
+FP_IDX_BY_STEM = {
+    "dbg_imf_ours": 0, "dumpB_if": 0, "dumpB_hash": 0,
+    "dumpA_if": 0, "dumpA_hash": 1, "dumpA_imf": 2,
+}
+
+
+def infer_fp_idx(path):
+    """由文件名推断指纹模型下标；未匹配到时退回 0（= 与旧行为一致）。"""
+    name = Path(path).name
+    for stem, idx in FP_IDX_BY_STEM.items():
+        if stem in name:
+            return idx
+    return 0
 
 
 def load_jsonl(p):
@@ -36,8 +58,8 @@ def load_jsonl(p):
     return recs
 
 
-def step_tensors(rec):
-    """→ ids[k], van[k], max_delta[k], var[k], pen_full[k], fp_side[k]"""
+def step_tensors(rec, fp_idx=0):
+    """→ ids[k], van[k], max_delta[k], var[k], pen_full[k], fp_side[k], delta_tgt[k], delta[k,N]"""
     ids = [r[0] for r in rec["topn"]]
     L = torch.tensor([r[1] for r in rec["topn"]], dtype=torch.float32)      # [k,N]
     n = L.shape[1]
@@ -47,8 +69,24 @@ def step_tensors(rec):
     max_delta = delta.max(dim=1).values
     var = L.var(dim=1, unbiased=True)                    # 与 ensemble_logit 内一致（无偏）
     pen_full = (L - van.unsqueeze(1)).abs().sum(dim=1) / (2 * (n - 1))     # α=1 时的应有减幅
-    fp_side = (L[:, 0] - L[:, 1:].mean(dim=1)) > 0.5     # 指纹模型在抬高该坐标
-    return ids, van, max_delta, var, pen_full, fp_side
+    rest = L[:, [j for j in range(n) if j != fp_idx]].mean(dim=1)
+    fp_side = (L[:, fp_idx] - rest) > 0.5                # 目标（指纹）模型在抬高该坐标
+    return ids, van, max_delta, var, pen_full, fp_side, delta[:, fp_idx], delta
+
+
+def solo_crit(delta, md, dt):
+    """P1-3b 判据：只压"恰好一个模型离群"的坐标。
+
+    K(v) = #{i: δ_i(v) ≥ SPIKE}；solo = max_i δ_i · 1[K=1]；tgt_solo = δ_target · 1[K=1]。
+    判据定义与真跑代码共用 `gate_core.gate_criterion_values`（delta 形状 [k,N] → model_dim=1）。
+    零点堆叠：K≠1 的坐标恒为 0（1fp-Hash 里占 98%），故分位阈值须在**正值**上取。
+    """
+    nsp = gate_core.solo_spike_count(delta, spike=SPIKE, model_dim=1)
+    z = torch.zeros_like(md)
+    solo = gate_core.gate_criterion_values(delta, criterion="solo", spike=SPIKE, model_dim=1)
+    return solo, torch.where(nsp == 1, dt, z)
+
+
 
 
 def quantile(xs, p):
@@ -67,6 +105,9 @@ CRITERIA = {           # 名字 -> (层级, 说明)
     "pen_full":       ("coord", "该坐标的应有减幅 R(v)=Σ|d|/(2(N−1))（α=1）"),
     "md_over_margin": ("coord", "max_delta / (top1−top2 边际)：相对边际的强度（自校准）"),
     "combo_md_ad":    ("coord", "max_delta × 1[三模型 argmax 不一致]"),
+    # —— 逐坐标判据（P1-3b 新增：单一模型离群）——
+    "solo":           ("coord", "【P1-3b】solo=max_i δ_i·1[恰好一个模型 δ≥SPIKE]（分位在正值上取）"),
+    "tgt_solo":       ("coord", "【P1-3b】solo ∩ 目标模型（δ_target·1[恰好一个模型离群]）"),
     # —— 步级判据（整步一个数）——
     "var_full":       ("step",  "【现有判据】全词表平均 var（D_step，来自 debug 文件）"),
     "var_topk":       ("step",  "top-k 内 var 的平均（原提案里的 var-topk）"),
@@ -84,6 +125,8 @@ def main():
     ap.add_argument("--out", default=r"records\P1-3_offline_screen.csv")
     ap.add_argument("--taus", default="85,90,95,99")
     ap.add_argument("--alphas", default="0.25,0.5,1.0,2.0")
+    ap.add_argument("--fp_idx", type=int, default=-1,
+                    help="指纹模型下标（决定'指纹侧/误伤'口径）；-1=按文件名推断")
     args = ap.parse_args()
 
     steps = load_jsonl(args.topn)
@@ -95,13 +138,16 @@ def main():
           % (len(steps), steps[0]["k"], len(dstep)))
 
     cache = []
+    fp_idx = args.fp_idx if args.fp_idx >= 0 else infer_fp_idx(args.topn)
+    print("指纹模型下标 fp_idx=%d（%s）" % (fp_idx, "命令行指定" if args.fp_idx >= 0 else "按文件名推断"))
     for rec in steps:
-        ids, van, md, var, pen, fps = step_tensors(rec)
+        ids, van, md, var, pen, fps, dt, delta = step_tensors(rec, fp_idx)
         L = torch.tensor([r[1] for r in rec["topn"]], dtype=torch.float32)   # [k,N]
         am = [int(L[:, j].argmax()) for j in range(L.shape[1])]               # 各模型自己的 argmax
         t2 = torch.topk(van, 2).values
         margin = float(t2[0] - t2[1])
         dis_am = 1.0 if len(set(am)) > 1 else 0.0
+        solo, tgt_solo = solo_crit(delta, md, dt)
         crit = {
             # 逐坐标
             "max_delta": md,
@@ -109,6 +155,8 @@ def main():
             "pen_full": pen,
             "md_over_margin": md / (margin + 1e-6),
             "combo_md_ad": md * dis_am,
+            "solo": solo,
+            "tgt_solo": tgt_solo,
             # 步级
             "max_var": torch.tensor([float(var.max())]),
             "var_topk": torch.tensor([float(var.mean())]),
@@ -116,7 +164,7 @@ def main():
             "n_high_delta": torch.tensor([float((md >= THETA_FP).sum())]),
             "argmax_diff": torch.tensor([dis_am]),
         }
-        cache.append(dict(ids=ids, van=van, md=md, var=var, pen=pen, fps=fps,
+        cache.append(dict(ids=ids, van=van, md=md, var=var, pen=pen, fps=fps, dt=dt,
                           crit=crit, D_step=dstep.get((rec["item"], rec["step"]))))
     print("判据预算完成。")
 
@@ -128,7 +176,7 @@ def main():
         fp_strong = flip_base = flip_fp = gated = 0
         leak = 0.0
         for c in cache:
-            van, pen, fps, md = c["van"], c["pen"], c["fps"], c["md"]
+            van, pen, fps, dt = c["van"], c["pen"], c["fps"], c["dt"]
             if crit_name == "none":
                 mask = torch.ones_like(van, dtype=torch.bool)
             elif level == "coord":
@@ -142,7 +190,7 @@ def main():
             fused = van - penalty
             leak += float((pen - penalty).clamp(min=0).sum())
             a_van, a_fus = int(van.argmax()), int(fused.argmax())
-            if bool(fps[a_fus]) and float(md[a_fus]) >= THETA_FP:
+            if bool(fps[a_fus]) and float(dt[a_fus]) >= THETA_FP:
                 fp_strong += 1
             if a_van != a_fus:
                 if bool(fps[a_van]):
@@ -166,10 +214,19 @@ def main():
                 v = c["D_step"] if crit_name == "var_full" else float(c["crit"][crit_name].item())
                 if v is not None:
                     vals.append(float(v))
+        # solo / tgt_solo 有零点堆叠（K≠1 的坐标恒为 0，1fp-Hash 里占 98%）
+        #   → 分位阈值必须在**正值**上取，否则 p90 会取到 0 而门全开。
+        if crit_name in POS_PCT_CRITERIA:
+            vals = [v for v in vals if v > 0.0]
+        if not vals:
+            continue
         for tp in taus:
             tau = quantile(vals, tp / 100.0)
             for a in alphas:
-                run_variant("%s_%s_p%d_a%g" % (crit_name, level, tp, a), level, crit_name, tau, a)
+                run_variant("%s_%s_p%d%s_a%g" %
+                            (crit_name, level, tp,
+                             "_pv" if crit_name in POS_PCT_CRITERIA else "", a),
+                            level, crit_name, tau, a)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
