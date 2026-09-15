@@ -170,6 +170,27 @@ def parse_legacy_name(stem):
     return None
 
 
+def parse_mdg_name(stem):
+    """`run_maxdelta.sh` 的命名：mdg_{scene}_{method}_{tag}
+    scene ∈ {b_imf,b_hash,b_if, b_arc_imf,b_arc_hash,b_arc_if, a_if,a_hash,a_imf, a_arc}
+    → (scenario, group, method, dataset)；method 里带 tag（如 maxdelta_gate_p90a2）以便区分档位。
+    """
+    m = re.match(r"^mdg_(?P<scene>b_arc_(?:imf|hash|if)|b_(?:imf|hash|if)|a_arc|a_(?:if|hash|imf))_"
+                 r"(?P<method>maxdelta_gate|thresh_ours)_(?P<tag>.+)$", stem)
+    if not m:
+        return None
+    scene, meth, tag = m.group("scene"), m.group("method"), m.group("tag")
+    if scene.startswith("b_arc_"):
+        g = FP_ALIAS[scene.split("_")[-1]]
+        return "Setting-B(1fp)", g, "%s_%s" % (meth, tag), "arc"
+    if scene.startswith("b_"):
+        g = FP_ALIAS[scene[2:]]
+        return "Setting-B(1fp)", g, "%s_%s" % (meth, tag), g
+    if scene == "a_arc":
+        return "Setting-A(3fp)", "-", "%s_%s" % (meth, tag), "arc"
+    return "Setting-A(3fp)", "-", "%s_%s" % (meth, tag), FP_ALIAS[scene[2:]]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", type=str,
@@ -182,16 +203,24 @@ def main():
                     help="改用旧命名（outputs/ens*.jsonl，既有实验的原始输出）→ 无需重跑即可做配对检验")
     args = ap.parse_args()
 
-    pattern = "ens*.jsonl" if args.legacy else "p0_*.jsonl"
-    files = sorted(Path(args.dir).glob(pattern))
+    pats = ["ens*.jsonl"] if args.legacy else ["p0_*.jsonl", "mdg_*.jsonl"]
+    files = []
+    for pat in pats:
+        files += sorted(Path(args.dir).glob(pat))
+    files = sorted(set(files))
     if not files:
-        print("未找到 %s/%s%s" % (args.dir, pattern,
-                                "（旧输出可能已被清理，那就只能跑 run_p0.sh fp）" if args.legacy else " —— 先跑 run_p0.sh"))
+        print("未找到 %s/%s%s" % (args.dir, " 或 ".join(pats),
+                                "（旧输出可能已被清理，那就只能跑 run_p0.sh fp）" if args.legacy else " —— 先跑 run_p0.sh / run_maxdelta.sh"))
         return
+
+    def parse_any(stem):
+        if stem.startswith("mdg_"):
+            return parse_mdg_name(stem)
+        return parse_legacy_name(stem) if args.legacy else parse_name(stem)
 
     rows, skipped = [], []
     for p in files:
-        parsed = parse_legacy_name(p.stem) if args.legacy else parse_name(p.stem)
+        parsed = parse_any(p.stem)
         if not parsed:
             print("跳过（命名不符）：%s" % p.name)
             skipped.append(p.name)
@@ -248,7 +277,7 @@ def main():
     if args.paired:
         table = {}   # (scenario, group, dataset) -> {method: {key: 0/1}}
         for p in files:
-            parsed = parse_legacy_name(p.stem) if args.legacy else parse_name(p.stem)
+            parsed = parse_any(p.stem)
             if not parsed:
                 continue
             sc, g, method, dataset = parsed

@@ -63,6 +63,22 @@ def compute_ensemble_logits(logits, method="vanilla", alpha=1.0, T=1.0, clip_c=N
             corrected.append(li - alpha * delta)
         return sum(corrected) / N
 
+    elif method == "maxdelta_gate":
+        # P1-3 主推方法：**逐词表坐标**门控，判据用 max_delta（一阶、与抑制量同源）
+        #   δ_i(v)      = ReLU( l_i(v) − l̄_{−i}(v) )
+        #   max_delta(v)= max_i δ_i(v)
+        #   门控：max_delta(v) > τ_md 才抑制该坐标；l̃_i(v) = l_i(v) − α·1[...]·δ_i(v)
+        #   聚合仍为均值；τ_md 由 --tau_pct 在 clean 数据上标定（见 compute_tau_md_from_clean）。
+        #   依据：P1-3 离线筛选（6 场景 × 180 变体）显示"逐坐标 + max_delta"最优；
+        #        整步判据（全词表平均 var 等）会把少数坐标的极端分歧抹平而失效。
+        stack = torch.stack(logits)                                  # [N, V]
+        others = (stack.sum(dim=0, keepdim=True) - stack) / (N - 1)  # l̄_{−i}
+        delta = torch.clamp(stack - others, min=0.0)                 # δ_i，[N, V]
+        thr = 0.0 if tau is None else float(tau)
+        gate = (delta.max(dim=0).values > thr).float()               # [V] 逐坐标 0/1
+        corrected = [stack[i] - alpha * gate * delta[i] for i in range(N)]
+        return sum(corrected) / N
+
     elif method == "median":
         return torch.stack(logits).median(dim=0).values
 
@@ -101,7 +117,7 @@ def compute_ensemble_logits(logits, method="vanilla", alpha=1.0, T=1.0, clip_c=N
         raise ValueError(f"unknown method: {method}")
 
 
-def _debug_record(item_idx, step, method, logits, l_ens, tau, k, tok1):
+def _debug_record(item_idx, step, method, logits, l_ens, tau, k, tok1, per_coord=False):
     """构造一个解码步的**坐标级**诊断记录（P1-2，只读不改结果）。
 
     对 vanilla 的 top-k 词表坐标，记录：
@@ -124,6 +140,7 @@ def _debug_record(item_idx, step, method, logits, l_ens, tau, k, tok1):
     margin = float(tk2[0] - tk2[1])
     argmax_van, argmax_fused = int(van.argmax()), int(l_ens.argmax())
     d_step = float(var.mean())                   # 现有门控判据（全词表平均）
+    md_top1 = float(delta[:, argmax_van].max())  # vanilla top-1 坐标自己的 max_delta（逐坐标门控用）
     topk = torch.topk(van, k)
     rows = []
     for rank, (v, idx) in enumerate(zip(topk.values.tolist(), topk.indices.tolist()), 1):
@@ -142,7 +159,9 @@ def _debug_record(item_idx, step, method, logits, l_ens, tau, k, tok1):
     return {
         "item": item_idx, "step": step, "method": method, "tau": tau,
         "D_step": round(d_step, 4),
-        "gate_open": (tau is None) or (d_step > float(tau)),
+        "max_delta_top1": round(md_top1, 4),
+        "gate_kind": "per_coord" if per_coord else ("step" if tau is not None else "none"),
+        "gate_open": (tau is None) or ((md_top1 > float(tau)) if per_coord else (d_step > float(tau))),
         "margin_van": round(margin, 4),
         "argmax_van": argmax_van, "argmax_fused": argmax_fused,
         "flip": bool(argmax_van != argmax_fused),
@@ -178,7 +197,7 @@ def _dump_topn(item_idx, step, method, logits, k):
 def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
                     method="vanilla", alpha=1.0, T=1.0, clip_c=None, tau=None,
                     debug_fh=None, debug_k=0, item_idx=None,
-                    logits_fh=None, logits_k=0):
+                    logits_fh=None, logits_k=0, gate_per_coord=False):
     """单个问题：3 模型逐步 logit 融合（greedy），返回生成文本。
 
     debug_fh/debug_k 打开时逐步写坐标级诊断记录；logits_fh/logits_k 打开时逐步写
@@ -208,7 +227,8 @@ def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
 
         l_ens = compute_ensemble_logits(logits, method=method, alpha=alpha, T=T, clip_c=clip_c, tau=tau)
         if debug_fh is not None and debug_k > 0:
-            rec = _debug_record(item_idx, step, method, logits, l_ens, tau, debug_k, tok1)
+            rec = _debug_record(item_idx, step, method, logits, l_ens, tau, debug_k, tok1,
+                                per_coord=gate_per_coord)
             debug_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         if logits_fh is not None and logits_k > 0:
             rec2 = _dump_topn(item_idx, step, method, logits, logits_k)
@@ -222,6 +242,47 @@ def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
 
     gen_ids = input_ids[0, orig_len:]
     return tok1.decode(gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+
+def compute_tau_md_from_clean(models, toks, clean_texts, devices, pct=95.0, bins=2000, cap=50.0):
+    """P1-3：在 **clean** 数据上标定 `max_delta` 的百分位阈值 τ_md（逐词表坐标）。
+
+    统计量：每个位置、每个词表坐标 v 的 `max_delta(v) = max_i ReLU(l_i(v) − l̄_{−i}(v))`。
+    实现：直方图累积（分位数用 bin 内线性插值）—— 避免把 100×50×15 万个数全部放内存。
+    返回 τ_md（float）；会打印参与统计的坐标数与被截断（>cap）的比例。
+    """
+    model1, model2, model3 = models
+    tok1, tok2, tok3 = toks
+    dev1, dev2, dev3 = devices
+    hist = torch.zeros(bins, dtype=torch.float64)
+    n_total = n_over = 0
+    for text in clean_texts:
+        inputs = tok1(text, return_tensors="pt")
+        ids, mask = inputs["input_ids"], inputs["attention_mask"]
+        outs = []
+        for m, ids_, mask_, dev in zip((model1, model2, model3),
+                                       (ids,) * 3, (mask,) * 3, (dev1, dev2, dev3)):
+            with torch.no_grad():
+                out = m(input_ids=ids_.to(dev), attention_mask=mask_.to(dev))
+            outs.append(out.logits[0].float().cpu())          # [seq, V]
+        stack = torch.stack(outs)                              # [N, seq, V]
+        n = stack.shape[0]
+        others = (stack.sum(dim=0, keepdim=True) - stack) / (n - 1)
+        md = torch.clamp(stack - others, min=0.0).max(dim=0).values.reshape(-1)   # [seq*V]
+        n_total += md.numel()
+        n_over += int((md > cap).sum())
+        hist += torch.histc(torch.clamp(md, max=cap - 1e-6), bins=bins, min=0.0, max=cap).double()
+    cum = torch.cumsum(hist, dim=0)
+    target = (pct / 100.0) * float(cum[-1])
+    idx = min(int(torch.searchsorted(cum, torch.tensor(target, dtype=torch.float64)).item()), bins - 1)
+    prev = float(cum[idx - 1]) if idx > 0 else 0.0
+    in_bin = float(hist[idx])
+    frac = 0.0 if in_bin <= 0 else (target - prev) / in_bin
+    tau = (cap * idx / bins) + frac * (cap / bins)
+    print("[τ_md] clean 样本=%d，统计坐标数=%.1fM，>%.1f 占比=%.3f%%，P%.0f = %.4f"
+          % (len(clean_texts), n_total / 1e6, cap,
+             100.0 * n_over / max(1, n_total), pct, tau))
+    return float(tau)
 
 
 def load_texts(path, key="question", num=50):
@@ -275,15 +336,18 @@ def main():
     parser.add_argument("--per_device_batch_size", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=40)
     parser.add_argument("--method", type=str, default="vanilla",
-                        choices=["vanilla", "ours", "thresh_ours", "median", "temperature", "clipping", "confidence", "random"])
+                        choices=["vanilla", "ours", "thresh_ours", "maxdelta_gate",
+                                 "median", "temperature", "clipping", "confidence", "random"])
     parser.add_argument("--alpha", type=float, default=1.0, help="ours/random 的抑制强度")
     parser.add_argument("--T", type=float, default=1.0, help="temperature 的温度")
     parser.add_argument("--clip_c", type=float, default=None, help="clipping 的阈值（默认取 95 分位）")
-    parser.add_argument("--tau_pct", type=float, default=90.0, help="thresh_ours 的 Clean 数据百分位(85/90/95)")
-    parser.add_argument("--tau", type=float, default=None, help="直接传入 tau 数值（若提供则跳过 Clean 计算）")
+    parser.add_argument("--tau_pct", type=float, default=90.0,
+                        help="thresh_ours 的 Clean 数据百分位(85/90/95)；maxdelta_gate 时为 τ_md 的百分位(建议 90/95/99)")
+    parser.add_argument("--tau", type=float, default=None,
+                        help="直接传入 tau 数值（若提供则跳过 Clean 计算；maxdelta_gate 时为 τ_md）")
     parser.add_argument("--clean_path", type=str,
                         default=str(config.REPO_ROOT / "datasets" / "utility" / "arc_100.jsonl"),
-                        help="thresh_ours 计算 τ 用的 Clean 数据（取 question 字段）")
+                        help="thresh_ours / maxdelta_gate 计算 τ 用的 Clean 数据（取 question 字段）")
     parser.add_argument("--num_clean", type=int, default=100, help="Clean 数据条数")
     parser.add_argument("--debug_topk", type=int, default=0,
                         help="P1-2 坐标级诊断：对 vanilla 的 top-k 词表坐标逐步 dump（0=关闭，默认关闭；只读，不改变生成结果）")
@@ -326,17 +390,23 @@ def main():
     models = (model1, model2, model3)
     toks = (tok1, tok2, tok3)
 
-    # ---- thresh_ours：确定 τ（优先用传入的 --tau，否则用 Clean 数据计算）----
+    # ---- 阈值类方法：确定 τ（优先用传入的 --tau，否则用 Clean 数据计算）----
+    #   thresh_ours  : τ = clean 上「全词表平均 var」的分位（整步门控）
+    #   maxdelta_gate: τ_md = clean 上「逐坐标 max_delta」的分位（逐坐标门控，P1-3）
     tau = None
-    if args.method == "thresh_ours":
+    if args.method in ("thresh_ours", "maxdelta_gate"):
         if args.tau is not None:
             tau = args.tau
             print(f"use provided tau = {tau:.4f}")
         else:
             print(f"computing tau from Clean data (pct={args.tau_pct}, num={args.num_clean}) ...")
             clean_texts = load_texts(args.clean_path, key="question", num=args.num_clean)
-            tau = compute_threshold_from_clean(models, toks, clean_texts, devices, args.tau_pct)
-            print(f"tau_{args.tau_pct} = {tau:.4f}")
+            if args.method == "maxdelta_gate":
+                tau = compute_tau_md_from_clean(models, toks, clean_texts, devices, args.tau_pct)
+                print(f"tau_md_{args.tau_pct} = {tau:.4f}  (maxdelta_gate)")
+            else:
+                tau = compute_threshold_from_clean(models, toks, clean_texts, devices, args.tau_pct)
+                print(f"tau_{args.tau_pct} = {tau:.4f}")
 
     # ---- 数据与 collate 分派（与 single_model_test.py 一致）----
     test_dataset = load_dataset("json", data_files=args.test_set)["train"]
@@ -389,7 +459,8 @@ def main():
                 question, args.max_new_tokens, (device1, device2, device3), eos_id,
                 method=args.method, alpha=args.alpha, T=args.T, clip_c=args.clip_c, tau=tau,
                 debug_fh=debug_fh, debug_k=args.debug_topk, item_idx=item_idx,
-                logits_fh=logits_fh, logits_k=args.debug_dump_logits)
+                logits_fh=logits_fh, logits_k=args.debug_dump_logits,
+                gate_per_coord=(args.method == "maxdelta_gate"))
             pred_solution = gen
             if "gsm" in args.test_set.lower():
                 # 与 SVA.py / TFA.py / single_model_test.py 保持一致：pred 与 label 都取数值。
