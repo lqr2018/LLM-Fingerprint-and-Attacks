@@ -171,12 +171,14 @@ def parse_legacy_name(stem):
 
 
 def parse_mdg_name(stem):
-    """`run_maxdelta.sh` 的命名：mdg_{scene}_{method}_{tag}
+    """`run_maxdelta.sh` / `run_gapsupp.sh` 的命名：{mdg|gsp}_{scene}_{method}_{tag}
     scene ∈ {b_imf,b_hash,b_if, b_arc_imf,b_arc_hash,b_arc_if, a_if,a_hash,a_imf, a_arc}
     → (scenario, group, method, dataset)；method 里带 tag（如 maxdelta_gate_p90a2）以便区分档位。
+    method ∈ {maxdelta_gate, thresh_ours, gap_supp}（gap_supp = P1-3c「门控 × 差异量」）。
     """
-    m = re.match(r"^mdg_(?P<scene>b_arc_(?:imf|hash|if)|b_(?:imf|hash|if)|a_arc|a_(?:if|hash|imf))_"
-                 r"(?P<method>maxdelta_gate|thresh_ours)_(?P<tag>.+)$", stem)
+    m = re.match(r"^(?:mdg|gsp)_"
+                 r"(?P<scene>b_arc_(?:imf|hash|if)|b_(?:imf|hash|if)|a_arc|a_(?:if|hash|imf))_"
+                 r"(?P<method>maxdelta_gate|thresh_ours|gap_supp)_(?P<tag>.+)$", stem)
     if not m:
         return None
     scene, meth, tag = m.group("scene"), m.group("method"), m.group("tag")
@@ -203,7 +205,7 @@ def main():
                     help="改用旧命名（outputs/ens*.jsonl，既有实验的原始输出）→ 无需重跑即可做配对检验")
     args = ap.parse_args()
 
-    pats = ["ens*.jsonl"] if args.legacy else ["p0_*.jsonl", "mdg_*.jsonl"]
+    pats = ["ens*.jsonl"] if args.legacy else ["p0_*.jsonl", "mdg_*.jsonl", "gsp_*.jsonl"]
     files = []
     for pat in pats:
         files += sorted(Path(args.dir).glob(pat))
@@ -214,7 +216,7 @@ def main():
         return
 
     def parse_any(stem):
-        if stem.startswith("mdg_"):
+        if stem.startswith(("mdg_", "gsp_")):
             return parse_mdg_name(stem)
         return parse_legacy_name(stem) if args.legacy else parse_name(stem)
 

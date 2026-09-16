@@ -116,6 +116,66 @@ def test_tau_from_clean():
           % (t_loo, t_solo))
 
 
+def test_spike_from_clean():
+    """spike 标定（clean 上 δ₍₂₎ 的分位）：分位越高标定值越大；本 fixture 的 δ₍₂₎ 只取 0 或 4.5。"""
+    m = make_models([[10.0, 1.0, 5.0, 2.0], [1.0, 10.0, 5.2, 2.0], [1.0, 10.0, 4.8, 2.0]])
+    toks = (FakeTok(), FakeTok(), FakeTok())
+    devs = (torch.device("cpu"),) * 3
+    texts = ["q1", "q2"]
+    s50 = E.compute_spike_from_clean(m, toks, texts, devs, pct=50.0)
+    s99 = E.compute_spike_from_clean(m, toks, texts, devs, pct=99.0)
+    # δ₍₂₎ 的分布：坐标0/2/3 → 0（占多数），坐标1 → 4.5
+    assert s50 < 0.1, s50
+    assert 4.4 < s99 < 4.6, s99
+    assert s50 <= s99
+    print("  [E] compute_spike_from_clean：P50=%.4f / P99=%.4f ... OK" % (s50, s99))
+
+
+def test_gap_supp_path():
+    """P1-3c `--method gap_supp` 的真代码路径：手算对照 + 死区 + α=2 压到第二名之下。"""
+    m = make_models([[10.0, 1.0, 5.0, 2.0], [1.0, 10.0, 5.2, 2.0], [1.0, 10.0, 4.8, 2.0]])
+    logits = [x.v for x in m]
+    van = sum(logits) / 3
+    # 坐标0 [10,1,1]：gap=9 > τ=5 ⇒ α=1 削平到第二名(1) ⇒ 融合 1；其余坐标 gap≤5 ⇒ 不动
+    g1 = E.compute_ensemble_logits(logits, method="gap_supp", alpha=1.0, tau=5.0)
+    assert torch.allclose(g1, torch.tensor([1.0, 7.0, 5.0, 2.0])), g1
+    # τ 高于全部 gap ⇒ 完全 vanilla（死区）
+    assert torch.allclose(E.compute_ensemble_logits(logits, method="gap_supp", alpha=1.0, tau=9.5),
+                          van, atol=1e-6)
+    # α=2 ⇒ 压到第二名之下 gap：坐标0 = 10 − 2*9 = −8 ⇒ 融合 (−8+1+1)/3 = −2
+    g2 = E.compute_ensemble_logits(logits, method="gap_supp", alpha=2.0, tau=5.0)
+    assert abs(float(g2[0]) - (-2.0)) < 1e-6, g2[0]
+    print("  [F] gap_supp 真路径：α=1 削平到第二名 / 死区 / α=2 过冲 ... OK")
+
+
+def test_debug_record_gap():
+    """gap_supp 的诊断字段：gate_kind=gap:top-gap，gap_top1 命中 vanilla top-1 坐标的顶部间隙。"""
+    m = make_models([[10.0, 1.0], [1.0, 5.0], [2.0, 5.0]])   # vanilla argmax = 坐标0（4.33 > 3.67）
+    logits = [x.v for x in m]
+    fused = E.compute_ensemble_logits(logits, method="gap_supp", alpha=1.0, tau=5.0)
+    rec = E._debug_record(0, 0, "gap_supp", logits, fused, 5.0, 2, FakeTok())
+    assert rec["argmax_van"] == 0, rec["argmax_van"]
+    assert rec["gate_kind"] == "gap:top-gap", rec["gate_kind"]
+    assert abs(rec["gap_top1"] - 8.0) < 1e-6, rec["gap_top1"]      # 10 − 2 = 8
+    assert abs(rec["gate_crit_top1"] - 8.0) < 1e-6
+    assert rec["gate_open"] is True                                 # 8 > 5 ⇒ 门开
+    print("  [G] gap_supp 诊断字段（gap_top1 / gate_open）正确 ... OK")
+
+
+def test_gap_tau_from_clean():
+    """τ 的 clean 标定：统计量 = 顶部间隙 gap = [9, 0, 0.2, 0]（逐坐标）⇒ P50≈0、P90≈9。"""
+    m = make_models([[10.0, 1.0, 5.0, 2.0], [1.0, 10.0, 5.2, 2.0], [1.0, 10.0, 4.8, 2.0]])
+    toks = (FakeTok(), FakeTok(), FakeTok())
+    devs = (torch.device("cpu"),) * 3
+    texts = ["q1", "q2"]
+    t50 = E.compute_gap_tau_from_clean(m, toks, texts, devs, pct=50.0)
+    t90 = E.compute_gap_tau_from_clean(m, toks, texts, devs, pct=90.0)
+    assert t50 < 0.1, t50
+    assert 8.9 < t90 < 9.1, t90
+    assert t50 <= t90
+    print("  [H] compute_gap_tau_from_clean：P50=%.4f / P90=%.4f ... OK" % (t50, t90))
+
+
 def test_ensemble_decode_end_to_end():
     m = make_models([[10.0, 1.0, 5.0, 2.0], [1.0, 10.0, 5.2, 2.0], [1.0, 10.0, 4.8, 2.0]])
     toks = (FakeTok(), FakeTok(), FakeTok())
@@ -124,9 +184,12 @@ def test_ensemble_decode_end_to_end():
                             alpha=2.0, tau=0.0, criterion="solo", spike=0.5)
     out2 = E.ensemble_decode(m, toks, "question", 2, devs, 99, method="maxdelta_gate",
                              alpha=2.0, tau=0.0, criterion="loo_max", spike=0.5)
+    out3 = E.ensemble_decode(m, toks, "question", 2, devs, 99, method="gap_supp",
+                             alpha=1.0, tau=5.0)
     assert isinstance(out, str) and out == "tt", out     # 2 步 × 1 token
     assert isinstance(out2, str) and out2 == "tt", out2
-    print("  [D] ensemble_decode 端到端（criterion/spike 贯穿到生成）... OK")
+    assert isinstance(out3, str) and out3 == "tt", out3
+    print("  [D] ensemble_decode 端到端（criterion/spike/gap_supp 贯穿到生成）... OK")
 
 
 if __name__ == "__main__":
@@ -134,5 +197,11 @@ if __name__ == "__main__":
     _, lg = test_compute_ensemble_logits()
     test_debug_record(lg)
     test_tau_from_clean()
+    test_spike_from_clean()
+    test_gap_supp_path()
+    test_debug_record_gap()
+    test_gap_tau_from_clean()
+    test_ensemble_decode_end_to_end()
+    print("全部通过 ✅")
     test_ensemble_decode_end_to_end()
     print("全部通过 ✅")

@@ -3,7 +3,8 @@
 #
 # 用法（在 TFA_SVA/ 下）：
 #   bash -n run_maxdelta.sh            # 语法自检
-#   SUBSET=solo bash run_maxdelta.sh fp1   # 【推荐先跑】只跑 solo 档（6 次短跑）
+#   SUBSET=primary bash run_maxdelta.sh all   # ⭐ 只跑"唯一部署配置"（论文主结论用这个）
+#   SUBSET=solo bash run_maxdelta.sh fp1      # 只跑 solo 两档（1fp，6 次短跑）
 #   bash run_maxdelta.sh fp1           # 1fp 三组 × 6 档，指纹测试集（FSR）
 #   bash run_maxdelta.sh fp3           # 3fp × 6 档 × 3 个测试集
 #   bash run_maxdelta.sh acc1          # 1fp 三组 × 6 档，ARC-100 的 ACC
@@ -11,6 +12,10 @@
 #   bash run_maxdelta.sh all
 #   SUBSET=loo bash run_maxdelta.sh fp1    # 只跑原 4 档（= 旧行为）
 #   DRYRUN=1 bash run_maxdelta.sh fp1  # 只打印命令
+#
+# ⚠️ 威胁模型约束：防御方不知道指纹类型、也不知道哪些模型带指纹 ⇒
+#    **全场景只能用同一套配置**（本文件的 ⭐ 那档），其余档位仅作消融/敏感性，
+#    **禁止**"某场景表现最好就换那档"（详见 doc/P1-3离线筛选结果.md §9 开头）。
 #
 # 档位：
 #   档1 maxdelta_gate τ_pct=90 α=1 (loo_max)   档2 τ_pct=95 α=2   档3 τ_pct=90 α=2
@@ -43,17 +48,24 @@ FP_IMF=../datasets/fingerprint_test/test_stego10.jsonl
 
 # 六档：method tau_pct alpha 标签 [criterion] [spike]
 VARIANTS=(
-  "maxdelta_gate 90 1 p90a1        loo_max 0.5"
-  "maxdelta_gate 95 2 p95a2        loo_max 0.5"
-  "maxdelta_gate 90 2 p90a2        loo_max 0.5"
-  "thresh_ours   90 1 p90a1_old    loo_max 0.5"
-  "maxdelta_gate 85 2 solop85a2    solo    0.5"
-  "maxdelta_gate 90 2 solop90a2    solo    0.5"
+  "maxdelta_gate 90 1 p90a1            loo_max 0.5"
+  "maxdelta_gate 95 2 p95a2            loo_max 0.5"
+  "maxdelta_gate 90 2 p90a2            loo_max 0.5"
+  "thresh_ours   90 1 p90a1_old        loo_max 0.5"
+  "maxdelta_gate 85 2 soloauto_p85a2   solo    auto"
+  "maxdelta_gate 85 2 solop85a2        solo    0.5"
+  "maxdelta_gate 90 2 solop90a2        solo    0.5"
 )
 
-# SUBSET=solo → 只跑 solo 档；SUBSET=loo → 只跑前 4 档；all → 全部
+# ⭐ 唯一部署配置（论文主结论只用它，全场景统一；禁止按场景/类型挑档）
+#    maxdelta_gate + criterion=solo + spike=auto(clean 标定 δ₍₂₎ 的 P99) + τ_pct=85 + α=2
+#    ← 标签 soloauto_p85a2；判据/α 由真跑前的离线筛选选定（预注册），spike 由 clean 标定（无人工常数）
+#    其余档位仅作消融/敏感性（其中 solop85a2/solop90a2 是固定 spike=0.5 的旧档）。
+#
+# SUBSET=primary → 只跑 ⭐ 部署配置；solo → 跑 3 个 solo 档；loo → 跑前 4 档；all → 全部
 pick() {
   case "$SUBSET" in
+    primary) case "$1" in *" soloauto_p85a2 "*) return 0 ;; *) return 1 ;; esac ;;
     solo) case "$1" in *" solo "*) return 0 ;; *) return 1 ;; esac ;;
     loo)  case "$1" in *" solo "*) return 1 ;; *) return 0 ;; esac ;;
     *)    return 0 ;;

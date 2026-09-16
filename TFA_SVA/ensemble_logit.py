@@ -3,6 +3,10 @@
 Logit-level ensemble（P2/P4/P5 通用）：
     3 个模型逐 token 融合 logits，支持多种融合方式：
       vanilla / ours(disagreement suppression) / median / temperature / clipping / confidence / random
+      thresh_ours   : 整步门控（D(t) > τ 才抑制）
+      maxdelta_gate : 逐坐标门控（判据 loo_max / solo）+ 抑制 α·1[crit>τ]·δ   （P1-3/P1-3b）
+      gap_supp      : 「门控 × 差异量」p = α·1[gap>τ]·gap，gap = x₍₁₎ − x₍₂₎   （P1-3c 定式）
+                      τ 只当触发线（clean 标定）、α 只当力度 ⇒ **α=1 恰好削平到第二名（完全消除领先）**
 
 用法（从 TFA_SVA/ 目录，3 卡机器上每模型一卡）：
     python ensemble_logit.py --test_set ../datasets/fingerprint_test/test_IF_10.json \
@@ -33,7 +37,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def compute_ensemble_logits(logits, method="vanilla", alpha=1.0, T=1.0, clip_c=None, tau=None,
-                            criterion="loo_max", spike=None):
+                            criterion="loo_max", spike=None, gap_soft=0.0):
     """logits: list of [V] fp32 cpu tensor（各模型最后一步 logits）
     返回融合后的 [V] tensor。
 
@@ -70,6 +74,15 @@ def compute_ensemble_logits(logits, method="vanilla", alpha=1.0, T=1.0, clip_c=N
             delta = torch.clamp(li - l_bar, min=0.0)
             corrected.append(li - alpha * delta)
         return sum(corrected) / N
+
+    elif method == "gap_supp":
+        # 【P1-3c】「门控 × 差异量」抑制（推荐方法，见 doc §12）：
+        #   gap(v) = x₍₁₎ − x₍₂₎ ;  p = α·1[gap > τ]·gap ;  只削 argmax 那一个模型
+        #   τ = 触发线（"多大算异常"，--gap_tau auto 时在 clean 上按顶部间隙分位标定）
+        #   α = 力度：α=1 ⇒ 削平到第二名（完全消除领先）；α=2 ⇒ 压到第二名之下
+        return gate_core.gap_suppress_fuse(torch.stack(logits), alpha=alpha,
+                                           tau=(0.0 if tau is None else float(tau)),
+                                           soft=gap_soft)
 
     elif method == "maxdelta_gate":
         # P1-3 主推方法：**逐词表坐标**门控，判据 / τ_md 见下（全部数学在 gate_core.py）
@@ -145,6 +158,14 @@ def _debug_record(item_idx, step, method, logits, l_ens, tau, k, tok1, per_coord
     d_step = float(var.mean())                   # 现有门控判据（全词表平均）
     md_top1 = float(delta[:, argmax_van].max())  # vanilla top-1 坐标自己的 max_delta（逐坐标门控用）
     crit_top1 = float(crit[argmax_van])          # 该坐标在当前判据（loo_max/solo）下的值
+    # P1-3c：gap_supp 的"门控统计量"是该坐标的**顶部间隙**（gap = x₍₁₎ − x₍₂₎），
+    # 诊断里一并记录，便于事后判断"指纹坐标当时有没有触发门控"。
+    is_gap = (method == "gap_supp")
+    gap_top1 = None
+    if is_gap and n > 1:
+        gap_all, _ = gate_core.argmax_gap(stack, model_dim=0)     # gap 形状 [1,V]（keepdim）
+        gap_top1 = float(gap_all.reshape(-1)[argmax_van])
+        crit_top1 = gap_top1
     topk = torch.topk(van, k)
     rows = []
     for rank, (v, idx) in enumerate(zip(topk.values.tolist(), topk.indices.tolist()), 1):
@@ -166,9 +187,13 @@ def _debug_record(item_idx, step, method, logits, l_ens, tau, k, tok1, per_coord
         "max_delta_top1": round(md_top1, 4),
         "criterion": criterion if per_coord else None,
         "spike": spike if per_coord else None,
+        "gap_top1": (round(gap_top1, 4) if gap_top1 is not None else None),
         "gate_crit_top1": round(crit_top1, 4),
-        "gate_kind": ("per_coord:%s" % criterion) if per_coord else ("step" if tau is not None else "none"),
-        "gate_open": (tau is None) or ((crit_top1 > float(tau)) if per_coord else (d_step > float(tau))),
+        "gate_kind": ("gap:top-gap" if is_gap else
+                      (("per_coord:%s" % criterion) if per_coord else
+                       ("step" if tau is not None else "none"))),
+        "gate_open": (tau is None) or ((crit_top1 > float(tau)) if (per_coord or is_gap)
+                                       else (d_step > float(tau))),
         "margin_van": round(margin, 4),
         "argmax_van": argmax_van, "argmax_fused": argmax_fused,
         "flip": bool(argmax_van != argmax_fused),
@@ -203,7 +228,7 @@ def _dump_topn(item_idx, step, method, logits, k):
 
 def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
                     method="vanilla", alpha=1.0, T=1.0, clip_c=None, tau=None,
-                    criterion="loo_max", spike=SOLO_SPIKE_DEFAULT,
+                    criterion="loo_max", spike=SOLO_SPIKE_DEFAULT, gap_soft=0.0,
                     debug_fh=None, debug_k=0, item_idx=None,
                     logits_fh=None, logits_k=0, gate_per_coord=False):
     """单个问题：3 模型逐步 logit 融合（greedy），返回生成文本。
@@ -234,7 +259,8 @@ def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
             logits.append(out.logits[0, -1, :].float().cpu())  # [V]
 
         l_ens = compute_ensemble_logits(logits, method=method, alpha=alpha, T=T, clip_c=clip_c,
-                                        tau=tau, criterion=criterion, spike=spike)
+                                        tau=tau, criterion=criterion, spike=spike,
+                                        gap_soft=gap_soft)
         if debug_fh is not None and debug_k > 0:
             rec = _debug_record(item_idx, step, method, logits, l_ens, tau, debug_k, tok1,
                                 per_coord=gate_per_coord, criterion=criterion, spike=spike)
@@ -251,6 +277,92 @@ def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
 
     gen_ids = input_ids[0, orig_len:]
     return tok1.decode(gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+
+def compute_gap_tau_from_clean(models, toks, clean_texts, devices, pct=90.0, bins=2000, cap=50.0):
+    """P1-3c：在 **clean** 上标定"顶部间隙"阈值 τ —— `gap(v) = x₍₁₎(v) − x₍₂₎(v)` 的 P{pct} 分位。
+
+    语义：τ = **正常数据上允许保留的领先量**；`1 − pct/100` = 假阳性预算
+    （clean 上会被动手的坐标比例）。gap 恒 ≥ 0、几乎处处有定义 ⇒ 无"零点堆叠"问题。
+    只用 clean 数据、不用任何指纹类型/靶子信息。
+    """
+    model1, model2, model3 = models
+    tok1, tok2, tok3 = toks
+    dev1, dev2, dev3 = devices
+    hist = torch.zeros(bins, dtype=torch.float64)
+    n_total = 0
+    for text in clean_texts:
+        inputs = tok1(text, return_tensors="pt")
+        ids, mask = inputs["input_ids"], inputs["attention_mask"]
+        outs = []
+        for m, ids_, mask_, dev in zip((model1, model2, model3),
+                                       (ids,) * 3, (mask,) * 3, (dev1, dev2, dev3)):
+            with torch.no_grad():
+                out = m(input_ids=ids_.to(dev), attention_mask=mask_.to(dev))
+            outs.append(out.logits[0].float().cpu())
+        stack = torch.stack(outs)                                   # [N, seq, V]
+        gap, _ = gate_core.argmax_gap(stack, model_dim=0)            # [seq, V]
+        gap = gap.reshape(-1)
+        n_total += gap.numel()
+        hist += torch.histc(torch.clamp(gap, max=cap - 1e-6), bins=bins, min=0.0, max=cap).double()
+    cum = torch.cumsum(hist, dim=0)
+    target = (pct / 100.0) * float(cum[-1])
+    idx = min(int(torch.searchsorted(cum, torch.tensor(target, dtype=torch.float64)).item()), bins - 1)
+    prev = float(cum[idx - 1]) if idx > 0 else 0.0
+    in_bin = float(hist[idx])
+    frac = 0.0 if in_bin <= 0 else (target - prev) / in_bin
+    tau = (cap * idx / bins) + frac * (cap / bins)
+    n_above = float(hist[idx + 1:].sum()) + (1.0 - frac) * in_bin
+    rate = n_above / max(1.0, float(n_total))
+    print("[gap τ] clean 样本=%d，坐标数=%.2fM，P%.0f(顶部间隙) = %.4f → clean 门控率=%.3f%%"
+          % (len(clean_texts), n_total / 1e6, pct, tau, 100.0 * rate))
+    return float(tau)
+
+
+def compute_spike_from_clean(models, toks, clean_texts, devices, pct=99.0, bins=2000, cap=50.0):
+    """P1-3b：在 **clean** 数据上标定 `solo` 判据的"离群阈值" spike —— 取**第二大偏离** δ₍₂₎ 的分位。
+
+    语义：δ₍₂₎(v) = 三个模型 δ 里的第二大值。
+      - δ₍₂₎(v) <  spike → "只有一个模型抬起来了" ⇒ 允许门控（若同时 δ₍₁₎ > τ）；
+      - δ₍₂₎(v) ≥ spike → "不止一个模型抬高"（共识 / 多指纹撞车）⇒ **不门控**。
+    spike = clean 上 δ₍₂₎ 的 P{pct}（= "次高模型抬到多高就不算单一离群"），
+    与 τ 用**同一套 clean 标定流程**、同一个数据源 ⇒ 不引入人工常数，也不需要任何指纹类型/靶子信息。
+
+    注意：`solo` 的 τ 依赖 spike（统计量 = δ₍₁₎·1[δ₍₂₎ < spike]），故调用顺序是
+    **先 compute_spike_from_clean，再 compute_tau_md_from_clean(spike=...)**。
+    """
+    model1, model2, model3 = models
+    tok1, tok2, tok3 = toks
+    dev1, dev2, dev3 = devices
+    hist = torch.zeros(bins, dtype=torch.float64)
+    n_total = 0
+    for text in clean_texts:
+        inputs = tok1(text, return_tensors="pt")
+        ids, mask = inputs["input_ids"], inputs["attention_mask"]
+        outs = []
+        for m, ids_, mask_, dev in zip((model1, model2, model3),
+                                       (ids,) * 3, (mask,) * 3, (dev1, dev2, dev3)):
+            with torch.no_grad():
+                out = m(input_ids=ids_.to(dev), attention_mask=mask_.to(dev))
+            outs.append(out.logits[0].float().cpu())
+        stack = torch.stack(outs)                                  # [N, seq, V]
+        n = stack.shape[0]
+        others = (stack.sum(dim=0, keepdim=True) - stack) / (n - 1)
+        delta = torch.clamp(stack - others, min=0.0)               # [N, seq, V]
+        k = min(2, n)
+        d2 = delta.topk(k, dim=0).values[-1].reshape(-1)           # δ₍₂₎（N=3 即第二大）
+        n_total += d2.numel()
+        hist += torch.histc(torch.clamp(d2, max=cap - 1e-6), bins=bins, min=0.0, max=cap).double()
+    cum = torch.cumsum(hist, dim=0)
+    target = (pct / 100.0) * float(cum[-1])
+    idx = min(int(torch.searchsorted(cum, torch.tensor(target, dtype=torch.float64)).item()), bins - 1)
+    prev = float(cum[idx - 1]) if idx > 0 else 0.0
+    in_bin = float(hist[idx])
+    frac = 0.0 if in_bin <= 0 else (target - prev) / in_bin
+    spike = (cap * idx / bins) + frac * (cap / bins)
+    print("[spike] clean 样本=%d，δ₍₂₎ 坐标数=%.2fM，P%.0f(δ₍₂₎) = %.4f"
+          % (len(clean_texts), n_total / 1e6, pct, spike))
+    return float(spike)
 
 
 def compute_tau_md_from_clean(models, toks, clean_texts, devices, pct=95.0, bins=2000, cap=50.0,
@@ -359,7 +471,7 @@ def main():
     parser.add_argument("--per_device_batch_size", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=40)
     parser.add_argument("--method", type=str, default="vanilla",
-                        choices=["vanilla", "ours", "thresh_ours", "maxdelta_gate",
+                        choices=["vanilla", "ours", "thresh_ours", "maxdelta_gate", "gap_supp",
                                  "median", "temperature", "clipping", "confidence", "random"])
     parser.add_argument("--alpha", type=float, default=1.0, help="ours/random 的抑制强度")
     parser.add_argument("--T", type=float, default=1.0, help="temperature 的温度")
@@ -373,8 +485,21 @@ def main():
     parser.add_argument("--criterion", type=str, default="loo_max", choices=list(gate_core.CRITERIA),
                         help="maxdelta_gate 的逐坐标判据：loo_max=原判据 max_i δ_i；"
                              "solo=【P1-3b】只压'恰好一个模型离群'的坐标（方向敏感，且 τ 分位在正值上取）")
-    parser.add_argument("--spike", type=float, default=SOLO_SPIKE_DEFAULT,
-                        help="solo 判据的'离群'阈值：δ_i ≥ spike 记为一次 spike（默认 0.5）")
+    parser.add_argument("--gap_tau", type=str, default="auto",
+                        help="gap_supp 的 τ（顶部间隙的'正常领先'容许量）："
+                             "默认 auto = 在 clean 上标定顶部间隙的 P--gap_tau_pct 分位；"
+                             "给数值（如 0.0）则为固定值（消融）")
+    parser.add_argument("--gap_tau_pct", type=float, default=90.0,
+                        help="--gap_tau auto 时的 clean 分位（默认 90；1−pct/100 = 假阳性预算）")
+    parser.add_argument("--gap_soft", type=float, default=0.0,
+                        help="gap_supp 的门控平滑度：0 = 硬门控（默认；α=1 严格削平到第二名）；"
+                             ">0 用 sigmoid((gap−τ)/gap_soft) 做软门控（消融用）")
+    parser.add_argument("--spike", type=str, default="auto",
+                        help="solo 判据的'离群'阈值：δ_i ≥ spike 记为一次 spike。"
+                             "默认 auto = 在 clean 上标定「第二大偏离」的 P--spike_pct（无人工常数、与 τ 同一流程）；"
+                             "给数值（如 0.5）则为固定值，仅用于消融实验")
+    parser.add_argument("--spike_pct", type=float, default=99.0,
+                        help="--spike auto 时的 clean 分位（默认 99）")
     parser.add_argument("--clean_path", type=str,
                         default=str(config.REPO_ROOT / "datasets" / "utility" / "arc_100.jsonl"),
                         help="thresh_ours / maxdelta_gate 计算 τ 用的 Clean 数据（取 question 字段）")
@@ -401,7 +526,8 @@ def main():
 
     print(f"method={args.method} | loading models: {args.model_path1} | {args.model_path2} | {args.model_path3}")
     if args.method == "maxdelta_gate":
-        print(f"[maxdelta_gate] criterion={args.criterion} spike={args.spike} tau_pct={args.tau_pct}")
+        print(f"[maxdelta_gate] criterion={args.criterion} spike={args.spike} tau_pct={args.tau_pct}"
+              f"（spike 解析值在 τ 标定前打印）")
     model1 = AutoModelForCausalLM.from_pretrained(
         args.model_path1, device_map={"": str(device1)},
         torch_dtype=torch.float16, trust_remote_code=True).eval()
@@ -424,21 +550,55 @@ def main():
 
     # ---- 阈值类方法：确定 τ（优先用传入的 --tau，否则用 Clean 数据计算）----
     #   thresh_ours  : τ = clean 上「全词表平均 var」的分位（整步门控）
-    #   maxdelta_gate: τ_md = clean 上「逐坐标 max_delta」的分位（逐坐标门控，P1-3）
+    #   gap_supp     : τ = clean 上「顶部间隙 gap = x₍₁₎ − x₍₂₎」的分位（--gap_tau auto，P1-3c）
+    #                  p = α·1[gap > τ]·gap，只削 argmax 那一个模型 ⇒ **α=1 恰好削平到第二名**
+    #   maxdelta_gate: τ_md = clean 上「逐坐标判据」的分位（逐坐标门控，P1-3/P1-3b）
+    #   solo 的 `--spike`：默认 "auto" = 在 clean 上标定「第二大偏离 δ₍₂₎」的分位
+    #     （语义："次高模型也抬到多高就不再算作'单一模型离群'"；与 τ 同一套 clean 标定流程，
+    #      **不使用任何指纹类型/靶子信息**；给数值则退化为消融实验。）
     tau = None
-    if args.method in ("thresh_ours", "maxdelta_gate"):
-        if args.tau is not None:
+    spike = None
+    is_solo = (args.method == "maxdelta_gate" and args.criterion == "solo")
+    clean_texts = None
+
+    def _clean():
+        nonlocal clean_texts
+        if clean_texts is None:
+            print(f"loading clean data ({args.num_clean} lines from {args.clean_path}) ...")
+            clean_texts = load_texts(args.clean_path, key="question", num=args.num_clean)
+        return clean_texts
+
+    if args.method in ("thresh_ours", "maxdelta_gate", "gap_supp"):
+        # (a) solo 的 spike 先标定（τ 的统计量依赖它），保持"只用 clean、无人工常数"
+        if is_solo:
+            if str(args.spike).lower() == "auto":
+                spike = compute_spike_from_clean(models, toks, _clean(), devices, args.spike_pct)
+                print(f"[spike:auto] clean 上「第二大偏离 δ₍₂₎」的 P{args.spike_pct} = {spike:.4f}"
+                      f"（标定得出，无人工常数）")
+            else:
+                spike = float(args.spike)
+                print(f"[spike:fixed] = {spike:.4f}（消融档，非部署配置）")
+        # (b) τ
+        if args.method == "gap_supp":
+            if str(args.gap_tau).lower() == "auto":
+                tau = compute_gap_tau_from_clean(models, toks, _clean(), devices, args.gap_tau_pct)
+                print(f"[gap_tau:auto] τ = {tau:.4f}（clean 上顶部间隙的 P{args.gap_tau_pct}，"
+                      f"= 允许保留的正常领先）")
+            else:
+                tau = float(args.gap_tau)
+                print(f"[gap_tau:fixed] τ = {tau:.4f}（消融档）")
+        elif args.tau is not None:
             tau = args.tau
             print(f"use provided tau = {tau:.4f}")
         else:
             print(f"computing tau from Clean data (pct={args.tau_pct}, num={args.num_clean}) ...")
-            clean_texts = load_texts(args.clean_path, key="question", num=args.num_clean)
             if args.method == "maxdelta_gate":
-                tau = compute_tau_md_from_clean(models, toks, clean_texts, devices, args.tau_pct,
-                                                criterion=args.criterion, spike=args.spike)
-                print(f"tau_md_{args.tau_pct} = {tau:.4f}  (maxdelta_gate, criterion={args.criterion}, spike={args.spike})")
+                tau = compute_tau_md_from_clean(models, toks, _clean(), devices, args.tau_pct,
+                                                criterion=args.criterion,
+                                                spike=(spike if is_solo else None))
+                print(f"tau_md_{args.tau_pct} = {tau:.4f}  (maxdelta_gate, criterion={args.criterion})")
             else:
-                tau = compute_threshold_from_clean(models, toks, clean_texts, devices, args.tau_pct)
+                tau = compute_threshold_from_clean(models, toks, _clean(), devices, args.tau_pct)
                 print(f"tau_{args.tau_pct} = {tau:.4f}")
 
     # ---- 数据与 collate 分派（与 single_model_test.py 一致）----
@@ -491,7 +651,7 @@ def main():
                 (model1, model2, model3), (tok1, tok2, tok3),
                 question, args.max_new_tokens, (device1, device2, device3), eos_id,
                 method=args.method, alpha=args.alpha, T=args.T, clip_c=args.clip_c, tau=tau,
-                criterion=args.criterion, spike=args.spike,
+                criterion=args.criterion, spike=spike, gap_soft=args.gap_soft,
                 debug_fh=debug_fh, debug_k=args.debug_topk, item_idx=item_idx,
                 logits_fh=logits_fh, logits_k=args.debug_dump_logits,
                 gate_per_coord=(args.method == "maxdelta_gate"))
