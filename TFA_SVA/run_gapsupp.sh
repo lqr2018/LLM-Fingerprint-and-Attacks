@@ -22,14 +22,20 @@
 #   ⭐ 档1 gap_supp τ=clean P90 α=1   ← 门控当触发器 + α=1 完全消除（性质最干净）
 #      档2 gap_supp τ=clean P90 α=2   ← 更强力度（离线：3fp 上误伤↑，需真跑裁决）
 #      档3 gap_supp τ=0          α=1   ← 消融：无死区（= 纯"削平顶部间隙"，扰动↑）
+#   （`random_gate` 档已弃用：决策 2026-09-16 —— random 系基线不进主表，见 doc/最终数据清单.md §8-I）
 
 cd "$(dirname "$0")"
 STAGE=${1:-fp1}
 SUBSET=${SUBSET:-all}          # all / primary / nodz
 RUNS=0
 
-CLEAN=../datasets/utility/arc_clean_100.jsonl
-ARC=../datasets/utility/arc_100.jsonl
+# 可覆盖：CLEAN/ARC 数据集路径 + 输出名后缀 + 随机种子
+#   例（跑 ARC-300 以对齐 P0 官方基线，不覆盖 n=100 结果）：
+#     ARC=../datasets/utility/arc_300.jsonl TAGSUF=_arc300 SUBSET=primary bash run_gapsupp.sh acc1
+CLEAN=${CLEAN:-../datasets/utility/arc_clean_100.jsonl}
+ARC=${ARC:-../datasets/utility/arc_100.jsonl}
+TAGSUF=${TAGSUF:-}
+SEED=${SEED:-0}                # 只影响 random_gate（可复现）；其他档位不受影响
 MT_IF=40
 MT_HASH=40
 MT_IMF=128
@@ -49,14 +55,19 @@ VARIANTS=(
   "gap_supp auto 90 1 gtau90a1"
   "gap_supp auto 90 2 gtau90a2"
   "gap_supp 0    90 1 gtau0a1"
+  # ★已弃用（决策 2026-09-16）：random 系基线不进论文主表（见 doc/最终数据清单.md §8-I）。
+  #   如需"等能量、随机位置"的归因对照实验，取消下面一行的注释并用 SUBSET=ctrl：
+  # "random_gate auto 90 1 rgau90a1"
 )
 
 # ⭐ 唯一部署配置（论文主结论只用它，全场景统一）
 #    gap_supp + τ=clean P90（触发线）+ α=1（恰好削平到第二名 ⇒ 完全消除领先）
+# SUBSET: primary=只跑 ⭐ / nodz=τ=0 消融 / ctrl=只跑 random_gate 对照 / all=全部
 pick() {
   case "$SUBSET" in
     primary) case "$1" in *" gtau90a1"*) return 0 ;; *) return 1 ;; esac ;;
     nodz)    case "$1" in *" gtau0a1"*) return 0 ;; *) return 1 ;; esac ;;
+    ctrl)    case "$1" in *" rgau90a1"*) return 0 ;; *) return 1 ;; esac ;;
     *)       return 0 ;;
   esac
 }
@@ -77,9 +88,9 @@ run_group() {
     if [ -n "$clean" ]; then extra="--clean_path $clean"; else extra="--clean_path $CLEAN"; fi
     run python ensemble_logit.py --test_set "$ts" \
       --model_path1 "$m1" --model_path2 "$m2" --model_path3 "$m3" \
-      --output_file "../outputs/gsp_${prefix}_${meth}_${tag}.jsonl" \
+      --output_file "../outputs/gsp_${prefix}_${meth}_${tag}${TAGSUF}.jsonl" \
       --max_new_tokens "$mt" --method "$meth" --alpha "$alpha" \
-      --gap_tau "$gtau" --gap_tau_pct "$gpct" $extra
+      --gap_tau "$gtau" --gap_tau_pct "$gpct" --seed "$SEED" $extra
   done
 }
 

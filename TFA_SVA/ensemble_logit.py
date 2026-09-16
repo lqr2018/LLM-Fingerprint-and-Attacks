@@ -84,6 +84,12 @@ def compute_ensemble_logits(logits, method="vanilla", alpha=1.0, T=1.0, clip_c=N
                                            tau=(0.0 if tau is None else float(tau)),
                                            soft=gap_soft)
 
+    elif method == "random_gate":
+        # 【对照基线】等能量、随机位置：把 Ours 的（触发掩码 1[gap>τ], 削幅 α·gap）整体随机重排到词表上。
+        #   与 gap_supp 共用同一个 τ（iso-τ），只把"作用在哪"随机化 ⇒ 排除"任何等量扰动都管用"。
+        return gate_core.random_gate_suppress_fuse(
+            torch.stack(logits), alpha=alpha, tau=(0.0 if tau is None else float(tau)))
+
     elif method == "maxdelta_gate":
         # P1-3 主推方法：**逐词表坐标**门控，判据 / τ_md 见下（全部数学在 gate_core.py）
         #   loo_max：crit(v) = max_i δ_i(v)（原判据，整步 vs 逐坐标的对照已由 P1-3 完成）
@@ -471,7 +477,7 @@ def main():
     parser.add_argument("--per_device_batch_size", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=40)
     parser.add_argument("--method", type=str, default="vanilla",
-                        choices=["vanilla", "ours", "thresh_ours", "maxdelta_gate", "gap_supp",
+                        choices=["vanilla", "ours", "thresh_ours", "maxdelta_gate", "gap_supp", "random_gate",
                                  "median", "temperature", "clipping", "confidence", "random"])
     parser.add_argument("--alpha", type=float, default=1.0, help="ours/random 的抑制强度")
     parser.add_argument("--T", type=float, default=1.0, help="temperature 的温度")
@@ -494,6 +500,9 @@ def main():
     parser.add_argument("--gap_soft", type=float, default=0.0,
                         help="gap_supp 的门控平滑度：0 = 硬门控（默认；α=1 严格削平到第二名）；"
                              ">0 用 sigmoid((gap−τ)/gap_soft) 做软门控（消融用）")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="全局随机种子（只影响含随机性的方法：random / random_gate）"
+                             "⚠️ 只在启动时播种一次，**勿逐步重置 RNG**（否则 random_gate 每步同一置换）")
     parser.add_argument("--spike", type=str, default="auto",
                         help="solo 判据的'离群'阈值：δ_i ≥ spike 记为一次 spike。"
                              "默认 auto = 在 clean 上标定「第二大偏离」的 P--spike_pct（无人工常数、与 τ 同一流程）；"
@@ -517,6 +526,11 @@ def main():
     parser.add_argument("--model_path2", type=str, default=config.MODEL_PATH2)
     parser.add_argument("--model_path3", type=str, default=config.MODEL_PATH3)
     args = parser.parse_args()
+
+    # ---- 随机性方法（random / random_gate）的可复现性：**只在启动时播种一次** ----
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        print(f"[seed] torch.manual_seed({args.seed})（影响 random / random_gate 的重放）")
 
     # ---- 设备分配（3 卡：每模型一卡）----
     device1 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -568,7 +582,7 @@ def main():
             clean_texts = load_texts(args.clean_path, key="question", num=args.num_clean)
         return clean_texts
 
-    if args.method in ("thresh_ours", "maxdelta_gate", "gap_supp"):
+    if args.method in ("thresh_ours", "maxdelta_gate", "gap_supp", "random_gate"):
         # (a) solo 的 spike 先标定（τ 的统计量依赖它），保持"只用 clean、无人工常数"
         if is_solo:
             if str(args.spike).lower() == "auto":
@@ -579,7 +593,7 @@ def main():
                 spike = float(args.spike)
                 print(f"[spike:fixed] = {spike:.4f}（消融档，非部署配置）")
         # (b) τ
-        if args.method == "gap_supp":
+        if args.method in ("gap_supp", "random_gate"):
             if str(args.gap_tau).lower() == "auto":
                 tau = compute_gap_tau_from_clean(models, toks, _clean(), devices, args.gap_tau_pct)
                 print(f"[gap_tau:auto] τ = {tau:.4f}（clean 上顶部间隙的 P{args.gap_tau_pct}，"

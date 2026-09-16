@@ -95,6 +95,35 @@ def gap_suppress_fuse(stack, alpha=1.0, tau=0.0, soft=0.0):
     return (stack - p * onehot).mean(dim=0)                   # [1,V]*[N,V] → [N,V]
 
 
+def random_gate_suppress_fuse(stack, alpha=1.0, tau=0.0, generator=None):
+    """【对照基线】`random_gate`：**等能量、随机位置**的扰动（Ours 的严格对照）。
+
+    做法：按 Ours 的规则算出（触发掩码 `1[gap>τ]`, 削幅 `α·gap`），然后把这对
+    （掩码, 削幅）**整体随机重排到词表坐标上** ⇒ 扰动的**能量与频次与 Ours 完全相同**，
+    唯一被随机化的是"作用在哪些坐标"。被削的仍然是各目标坐标自己的 argmax 模型。
+
+    用途（论文）：排除"**任何等量扰动都管用**"——若随机重排后 FSR 回到 vanilla 水平，
+    则说明起作用的是 **`gap > τ` 这个定位规则**，而不是"削了这么多 logit"。
+
+    属性（可测）：① 触发坐标个数与 Ours 相同；② 削幅**多重集**与 Ours 相同（只是搬家）；
+    ③ 传入 `generator` 可复现（真跑用 CLI `--seed` 全局播种一次，**勿逐步重置 RNG**，
+    否则每步都会得到同一个置换）。
+
+    ⚠️ 与旧 `random` 的区别：旧 `random` 的幅度按**早期方法 `ours`** 定义（`α·δ_i`、多模型），
+    与最终方法 `gap_supp`（`α·gap`、只削 argmax 模型）不可比 ⇒ 本式才是新方法的匹配对照。
+    """
+    n = stack.shape[0]
+    if n < 2:
+        return stack.mean(dim=0)
+    gap, idx = argmax_gap(stack, model_dim=0)                     # gap=[1,V]
+    m = (gap > float(tau)).float()                                # [1,V] Ours 的触发掩码
+    V = stack.shape[1]
+    perm = torch.randperm(V, device=stack.device, generator=generator)   # 随机重排
+    p = float(alpha) * m[:, perm] * gap[:, perm]                  # [1,V] 掩码与削幅一起搬家
+    onehot = torch.zeros_like(stack).scatter_(0, idx.unsqueeze(0), 1.0)
+    return (stack - p * onehot).mean(dim=0)
+
+
 def maxdelta_gate_fuse(stack, alpha=1.0, tau=0.0, criterion="loo_max",
                        spike=SOLO_SPIKE_DEFAULT):
     """逐坐标门控抑制 + 均值聚合 → [V]（`--method maxdelta_gate` 的全部数学）。"""

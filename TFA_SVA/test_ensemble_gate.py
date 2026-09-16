@@ -176,6 +176,24 @@ def test_gap_tau_from_clean():
     print("  [H] compute_gap_tau_from_clean：P50=%.4f / P90=%.4f ... OK" % (t50, t90))
 
 
+def test_random_gate_path():
+    """`--method random_gate` 的真代码路径：与 gap_supp 共用 τ，等能量（L1 相同）、位置随机。"""
+    m = make_models([[10.0, 1.0, 5.0, 2.0], [1.0, 10.0, 5.2, 2.0], [1.0, 10.0, 4.8, 2.0]])
+    logits = [x.v for x in m]
+    van = sum(logits) / 3
+    gs = E.compute_ensemble_logits(logits, method="gap_supp", alpha=1.0, tau=5.0)
+    torch.manual_seed(0)
+    rg = E.compute_ensemble_logits(logits, method="random_gate", alpha=1.0, tau=5.0)
+    assert rg.shape == van.shape and torch.isfinite(rg).all()
+    # 等能量：与 vanilla 的 L1 偏差总量一致（V=4、仅坐标0 触发 ⇒ 位移总量相同）
+    assert abs(float((rg - van).abs().sum()) - float((gs - van).abs().sum())) < 1e-5
+    # τ 高于全部 gap ⇒ 退化为 vanilla
+    torch.manual_seed(0)
+    assert torch.allclose(E.compute_ensemble_logits(logits, method="random_gate",
+                                                    alpha=1.0, tau=1e9), van, atol=1e-6)
+    print("  [I] random_gate 真路径：等能量 / 高位 τ 退化 vanilla ... OK")
+
+
 def test_ensemble_decode_end_to_end():
     m = make_models([[10.0, 1.0, 5.0, 2.0], [1.0, 10.0, 5.2, 2.0], [1.0, 10.0, 4.8, 2.0]])
     toks = (FakeTok(), FakeTok(), FakeTok())
@@ -201,6 +219,7 @@ if __name__ == "__main__":
     test_gap_supp_path()
     test_debug_record_gap()
     test_gap_tau_from_clean()
+    test_random_gate_path()
     test_ensemble_decode_end_to_end()
     print("全部通过 ✅")
     test_ensemble_decode_end_to_end()

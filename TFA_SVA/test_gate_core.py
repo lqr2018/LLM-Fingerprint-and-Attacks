@@ -191,6 +191,42 @@ def test_gap_supp_offline_consistency():
     print("  [9] gap_supp 与离线 op_gate_gap 口径一致 ......... OK")
 
 
+def test_random_gate():
+    """对照基线 `random_gate`：与 Ours **等能量**（削幅多重集相同）、但**位置随机**。"""
+    torch.manual_seed(5)
+    stack = torch.randn(3, 40) * 0.2          # 小噪声：默认 gap < τ
+    stack[0, 0] += 12.0                      # 坐标0 单离群 ⇒ 只有它触发门控
+    tau = 1.0
+    van = stack.mean(dim=0)
+    ours = G.gap_suppress_fuse(stack, alpha=1.0, tau=tau)
+    gap, _ = G.argmax_gap(stack, model_dim=0)
+    assert int((gap.reshape(-1) > tau).sum()) == 1, "fixture：应只有 1 个坐标触发"
+    # ① 等能量：与 vanilla 的 L1 偏差总量与 Ours 相同（削幅只是搬家）
+    rg0 = G.random_gate_suppress_fuse(stack, alpha=1.0, tau=tau,
+                                      generator=torch.Generator().manual_seed(0))
+    assert abs(float((rg0 - van).abs().sum()) - float((ours - van).abs().sum())) < 1e-5
+    assert float((ours - van).abs().sum()) > 0.5          # Ours 确实动了手
+    # ② 位置随机：被碰的坐标（|偏差| 最大处）在多数 seed 下不是 Ours 的那个坐标
+    moved_elsewhere = 0
+    for s in range(5):
+        r = G.random_gate_suppress_fuse(stack, alpha=1.0, tau=tau,
+                                        generator=torch.Generator().manual_seed(s))
+        if int((r - van).abs().argmax()) != 0:
+            moved_elsewhere += 1
+    assert moved_elsewhere >= 4, moved_elsewhere
+    # ③ 可复现：同 seed ⇒ 完全相同；不同 seed ⇒ 一般不同
+    a = G.random_gate_suppress_fuse(stack, alpha=1.0, tau=tau,
+                                    generator=torch.Generator().manual_seed(0))
+    b = G.random_gate_suppress_fuse(stack, alpha=1.0, tau=tau,
+                                    generator=torch.Generator().manual_seed(1))
+    assert _close(a, rg0) and not _close(a, b)
+    # ④ τ 高于全部 gap ⇒ 不触发（退化为 vanilla）；N<2 ⇒ vanilla
+    assert _close(G.random_gate_suppress_fuse(stack, alpha=1.0, tau=1e9,
+                                              generator=torch.Generator().manual_seed(0)), van)
+    assert _close(G.random_gate_suppress_fuse(stack[:1], alpha=1.0, tau=tau), stack[0])
+    print("  [10] random_gate：等能量 / 位置随机 / 可复现 / N<2 ... OK")
+
+
 if __name__ == "__main__":
     print("gate_core 单元测试：")
     test_delta_and_criterion()
@@ -202,4 +238,5 @@ if __name__ == "__main__":
     test_offline_consistency()
     test_gap_supp()
     test_gap_supp_offline_consistency()
+    test_random_gate()
     print("全部通过 ✅")

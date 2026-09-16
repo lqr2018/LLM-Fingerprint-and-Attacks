@@ -178,7 +178,7 @@ def parse_mdg_name(stem):
     """
     m = re.match(r"^(?:mdg|gsp)_"
                  r"(?P<scene>b_arc_(?:imf|hash|if)|b_(?:imf|hash|if)|a_arc|a_(?:if|hash|imf))_"
-                 r"(?P<method>maxdelta_gate|thresh_ours|gap_supp)_(?P<tag>.+)$", stem)
+                 r"(?P<method>maxdelta_gate|thresh_ours|gap_supp|random_gate)_(?P<tag>.+)$", stem)
     if not m:
         return None
     scene, meth, tag = m.group("scene"), m.group("method"), m.group("tag")

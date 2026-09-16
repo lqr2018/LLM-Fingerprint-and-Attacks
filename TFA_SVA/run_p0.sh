@@ -1,6 +1,12 @@
 #!/bin/bash
-# P0 批量实验（服务器端执行）：ARC-300（P0-2）、指纹 20 条（P0-3）、GSM8K-100（P0-4）
-# 只跑关键 4 方法：vanilla / median / ours / thresh_ours
+# P0 批量实验（服务器端执行）：ARC-300（P0-2）、指纹测试集（P0-3）、GSM8K-100（P0-4）
+# 默认只跑关键 4 方法：vanilla / median / ours / thresh_ours
+# **可覆盖方法列表**（论文主表的通用基线就靠它补齐）：
+#   METHODS="temperature clipping confidence" bash run_p0.sh arc          # ARC-300 × 6 组 = 12 次
+#   METHODS="temperature clipping confidence" bash run_p0.sh fp           # 指纹集 × 6 组 = 18 次
+# **可覆盖温度**（temperature 基线的 T；默认 1.0）：
+#   T=0.5 METHODS=temperature bash run_p0.sh fp     # 尖锐档（更利于指纹）
+#   T=2.0 METHODS=temperature bash run_p0.sh arc    # 平坦档（趋于 vanilla）
 #
 # 用法（在 TFA_SVA/ 下）：
 #   bash run_p0.sh fp        # 只跑指纹测试集（Setting-A + Setting-B）
@@ -18,6 +24,8 @@
 # 例：ARC=../datasets/utility/arc_10.jsonl bash run_p0.sh arc   # 小样本冒烟测试
 ALPHA=${ALPHA:-1.0}            # ours/thresh_ours 的抑制强度
 TAU_PCT=${TAU_PCT:-90}         # thresh_ours 的 Clean 分位阈值（各组自动标定）
+T=${T:-1.0}                    # temperature 基线的温度（默认 1.0 = 各模型 softmax 概率平均；
+                               #   T<1 更尖锐/更利于指纹，T>1 更平坦/趋于 vanilla）
 
 MT_FP_IF=${MT_FP_IF:-40}       # 指纹测试集生成长度（与原实验一致：IF/Hash 短答案、ImF 长句）
 MT_FP_HASH=${MT_FP_HASH:-40}
@@ -27,6 +35,8 @@ MT_GSM=${MT_GSM:-256}          # GSM8K 是 CoT，需要长生成
 
 ARC=${ARC:-../datasets/utility/arc_300.jsonl}
 ARC_CLEAN=${ARC_CLEAN:-../datasets/utility/arc_clean_100.jsonl}   # τ 标定集（ARC train，与测试集不重叠）
+TAGSUF=${TAGSUF:-}            # 输出名后缀，插在**方法名之后**（保持 dataset 仍为最后一段，汇总可解析）
+                              #   例：TAGSUF=_T0.5 → p0_A_temperature_T0.5_arc.jsonl
 GSM=${GSM:-../datasets/utility/gsm8k_100.jsonl}
 FP_N=${FP_N:-10}               # 指纹测试集条数：默认 10（用与训练一致的既有 10 条集）
                                # 为什么不是 20/30：Hash/ImF 扩样必须“扩表/加配对 + 重训模型”，
@@ -44,7 +54,7 @@ BASE=${BASE:-../models/base/Qwen2.5-7B}
 
 cd "$(dirname "$0")"
 STAGE=${1:-all}
-METHODS="vanilla median ours thresh_ours"
+METHODS=${METHODS:-"vanilla median ours thresh_ours"}
 RUNS=0
 
 run() {
@@ -65,8 +75,8 @@ run_group() {
     if [ "$m" = "thresh_ours" ]; then extra="--tau_pct $TAU_PCT --clean_path $ARC_CLEAN"; fi
     run python ensemble_logit.py --test_set "$ts" \
       --model_path1 "$m1" --model_path2 "$m2" --model_path3 "$m3" \
-      --output_file "../outputs/${prefix}_${m}_${tag}.jsonl" \
-      --max_new_tokens "$mt" --method "$m" --alpha "$ALPHA" $extra
+      --output_file "../outputs/${prefix}_${m}${TAGSUF}_${tag}.jsonl" \
+      --max_new_tokens "$mt" --method "$m" --alpha "$ALPHA" --T "$T" $extra
   done
 }
 
