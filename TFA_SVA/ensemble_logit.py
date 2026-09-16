@@ -19,6 +19,7 @@ Logit-level ensemble（P2/P4/P5 通用）：
 import os
 import json
 import re
+import time
 import argparse
 
 import torch
@@ -525,6 +526,9 @@ def main():
     parser.add_argument("--model_path1", type=str, default=config.MODEL_PATH1)
     parser.add_argument("--model_path2", type=str, default=config.MODEL_PATH2)
     parser.add_argument("--model_path3", type=str, default=config.MODEL_PATH3)
+    parser.add_argument("--progress_every", type=int, default=20,
+                        help="每处理 N 条打印一次进度（含时间戳/已用时/样例预览），并**实时 flush** 输出文件；"
+                             "0=关闭。长跑时用它判断'是在跑还是卡住'（此前只在结束时才写盘，看不出进度）")
     args = parser.parse_args()
 
     # ---- 随机性方法（random / random_gate）的可复现性：**只在启动时播种一次** ----
@@ -561,6 +565,7 @@ def main():
     eos_id = tok1.eos_token_id
     models = (model1, model2, model3)
     toks = (tok1, tok2, tok3)
+    print("[loaded] 3 个模型与 tokenizer 就绪（%s）" % time.strftime("%H:%M:%S"))
 
     # ---- 阈值类方法：确定 τ（优先用传入的 --tau，否则用 Clean 数据计算）----
     #   thresh_ours  : τ = clean 上「全词表平均 var」的分位（整步门控）
@@ -658,6 +663,10 @@ def main():
         print("[debug_dump_logits=%d] top-N logits → %s（离线筛选用；不能替代端到端 FSR/ACC）"
               % (args.debug_dump_logits, lg_path))
     item_idx = -1
+    n_items = len(test_dataset)
+    t_start = time.time()
+    print("[eval] 开始评测：%d 条 × 最多 %d token | %s" %
+          (n_items, args.max_new_tokens, time.strftime("%Y-%m-%d %H:%M:%S")))
     for questions, answers in ds_loader:
         for question, answer in zip(questions, answers):
             item_idx += 1
@@ -684,6 +693,14 @@ def main():
                 "question": question, "original_sln": answer,
                 "pred_solution": pred_solution, "pred": pred, "label": label,
             }, ensure_ascii=False) + "\n")
+            fw.flush()                       # 实时落盘：长跑时可直接看文件增长
+            if args.progress_every and (item_idx + 1) % args.progress_every == 0:
+                used = time.time() - t_start
+                eta = used / (item_idx + 1) * (n_items - item_idx - 1)
+                print("[%d/%d] %s | 已用 %.1f min | 预计剩余 %.1f min | 样例: %s"
+                      % (item_idx + 1, n_items, time.strftime("%H:%M:%S"),
+                         used / 60.0, eta / 60.0,
+                         str(pred)[:50].replace("\n", " ")))
     fw.close()
     if debug_fh is not None:
         debug_fh.close()
@@ -702,7 +719,7 @@ def main():
         arc_parse_pred_ans(args.output_file)
     elif any(k in args.test_set.lower() for k in ["triviaqa", "nq", "anli"]):
         qa_parse_pred_ans(args.output_file)
-    print("done.")
+    print("done. 总用时 %.1f min | 输出：%s" % ((time.time() - t_start) / 60.0, args.output_file))
 
 
 if __name__ == "__main__":
