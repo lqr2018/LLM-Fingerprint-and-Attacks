@@ -8,6 +8,7 @@
 # 用法（在 TFA_SVA/ 下）：
 #   bash -n run_gapsupp.sh                    # 语法自检
 #   SUBSET=primary bash run_gapsupp.sh all    # ⭐ 预注册主配置（gtau90a1），全场景
+#   SUBSET=a2      bash run_gapsupp.sh all    # 只跑 α=2 消融档（4 次：acc1 三组 + acc3 一组）
 #   bash run_gapsupp.sh fp1                   # 1fp 三组 × 3 档，指纹测试集（FSR）
 #   bash run_gapsupp.sh fp3                   # 3fp × 3 档 × 3 个测试集
 #   bash run_gapsupp.sh acc1                  # 1fp 三组 × 3 档，ARC-100 的 ACC
@@ -62,11 +63,12 @@ VARIANTS=(
 
 # ⭐ 唯一部署配置（论文主结论只用它，全场景统一）
 #    gap_supp + τ=clean P90（触发线）+ α=1（恰好削平到第二名 ⇒ 完全消除领先）
-# SUBSET: primary=只跑 ⭐ / nodz=τ=0 消融 / ctrl=只跑 random_gate 对照 / all=全部
+# SUBSET: primary=只跑 ⭐ / nodz=τ=0 消融 / a2=只跑 α=2 档 / ctrl=random_gate（已弃用）/ all=全部
 pick() {
   case "$SUBSET" in
     primary) case "$1" in *" gtau90a1"*) return 0 ;; *) return 1 ;; esac ;;
     nodz)    case "$1" in *" gtau0a1"*) return 0 ;; *) return 1 ;; esac ;;
+    a2)      case "$1" in *" gtau90a2"*) return 0 ;; *) return 1 ;; esac ;;
     ctrl)    case "$1" in *" rgau90a1"*) return 0 ;; *) return 1 ;; esac ;;
     *)       return 0 ;;
   esac
