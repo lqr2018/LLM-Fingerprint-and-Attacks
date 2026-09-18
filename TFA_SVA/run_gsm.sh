@@ -9,7 +9,8 @@
 #   bash -n run_gsm.sh                      # 语法自检
 #   DRYRUN=1 bash run_gsm.sh all            # 只打印命令
 #   bash run_gsm.sh prep                    # ★准备 100 条子集（gsm8k_100.jsonl，幂等；FORCE=1 重建）
-#   bash run_gsm.sh smoke                   # 5 条计时探针（已实测：55s/5 条 ⇒ 100 条 ≈ 18 min/次）
+#   bash run_gsm.sh probe1                  # ★单模型对照（base/IF/Hash/ImF 各跑同一小样本）
+#   bash run_gsm.sh smoke                   # 小样本探针（SMOKE_SCEN 默认 A+Bimf）：计时 + 自动诊断
 #   bash run_gsm.sh run                     # 正式跑：METHODS × SCENARIOS
 #   bash run_gsm.sh diag                    # 诊断（nan/算错/缺字段）+ 汇总 + 配对检验
 #   bash run_gsm.sh clean                   # 删掉 outputs 里的 0 字节空壳（会导致汇总出 nan 行）
@@ -29,6 +30,11 @@
 # ⚠️ 必须用**本仓库修改版** `ensemble_logit.py`（GSM 的 label 已改为数值口径，否则 ACC 恒为 0）
 # ⚠️ 子集由 `prep` 阶段自动生成（从 gsm8k_300.jsonl 取前 GSM_N 条），**不需要手工 head**；
 #    数据集自动定位顺序：`gsm8k_${GSM_N}.jsonl` → `gsm8k_100.jsonl` → `gsm8k_300.jsonl`（命中非目标条数时会提示）。
+#
+# 小样本诊断协议（2026-09-18 加入；起因：3fp 冒烟 ACC=0）：
+#   ① `probe1`：**base 单独**能不能做 GSM8K？若 base 也 ≈0 ⇒ 问题在提示/截断；若 base 正常而指纹模型 0 ⇒ 能力被 SFT 挤掉
+#   ② `smoke`（含 Bimf）：**3fp（无任何干净模型）** vs **Bimf（1 指纹 + 2×base）** 谁还能做？
+#   ③ 两者都自动调用 `check_gsm_output.py --items N --cap $MT` ⇒ 直接给出 算对/nan/算错/复读/截断 的分解
 
 cd "$(dirname "$0")"
 STAGE=${1:-all}
@@ -37,6 +43,8 @@ if [ "$#" -gt 1 ]; then
 fi
 METHODS=${METHODS:-"vanilla median gap_supp"}
 SCENARIOS=${SCENARIOS:-"A Bimf"}
+SMOKE_SCEN=${SMOKE_SCEN:-"A Bimf"}     # smoke 阶段要探的场景（A=3fp 无干净模型；Bimf=1fp）
+SMOKE_N=${SMOKE_N:-5}                  # 小样本条数（probe1/smoke 共用）
 MT=${MT:-256}                          # GSM8K 是 CoT 长生成，**不要用 ARC 的 32**
 GSM_N=${GSM_N:-100}                    # ★子集条数（默认 100：实测 ~18 min/次；300 约 55 min/次）
 FORCE=${FORCE:-}                       # prep 时 FORCE=1 重建子集（默认幂等跳过）
@@ -132,19 +140,42 @@ if [ "$STAGE" = "clean" ] || [ "$STAGE" = "all" ]; then
   done
 fi
 
-# ---------------- smoke：5 条计时探针（决定 n=100 还是 n=300）----------------
+# ---------------- smoke：小样本探针（默认 A + Bimf；先确认"哪组还能做 GSM8K"）----------------
 if [ "$STAGE" = "smoke" ]; then
-  SMOKE=../datasets/utility/gsm8k_smoke5.jsonl
-  head -5 "$GSM" > "$SMOKE"
-  echo "===== [smoke] 5 条 × $MT token × 3 模型（method=vanilla）====="
-  t0=$(date +%s)
-  run python ensemble_logit.py --test_set "$SMOKE" \
-    --model_path1 "$M_IF" --model_path2 "$M_HASH" --model_path3 "$M_IMF" \
-    --output_file "../outputs/smoke_gsm_vanilla.jsonl" \
-    --max_new_tokens "$MT" --method vanilla --progress_every 1
-  t1=$(date +%s)
-  d=$((t1 - t0))
-  echo "⏱ smoke 用时 ${d}s / 5 条 ⇒ 100 条 ≈ $((d * 20 / 60)) min，300 条 ≈ $((d * 60 / 60)) min（单次运行）"
+  SMOKE=../datasets/utility/gsm8k_smoke${SMOKE_N}.jsonl
+  head -"$SMOKE_N" "$GSM" > "$SMOKE"
+  echo "===== [smoke] $SMOKE_N 条 × $MT token | SMOKE_SCEN=$SMOKE_SCEN（method=vanilla）====="
+  for s in $SMOKE_SCEN; do
+    set -- $(scen_models "$s")
+    prefix="$1"; m1="$2"; m2="$3"; m3="$4"
+    if [ -z "$prefix" ]; then echo "跳过未知场景：$s（可选 A / Bif / Bhash / Bimf）"; continue; fi
+    OUT="../outputs/smoke_gsm_${s}.jsonl"
+    echo "--- 场景 $s: $m1 / $m2 / $m3 ---"
+    t0=$(date +%s)
+    run python ensemble_logit.py --test_set "$SMOKE" \
+      --model_path1 "$m1" --model_path2 "$m2" --model_path3 "$m3" \
+      --output_file "$OUT" --max_new_tokens "$MT" --method vanilla --progress_every 1
+    t1=$(date +%s)
+    d=$((t1 - t0))
+    echo "⏱ $s: ${d}s / $SMOKE_N 条 ⇒ 100 条 ≈ $((d * 100 / SMOKE_N / 60)) min/次"
+    python check_gsm_output.py "$OUT" --items "$SMOKE_N" --cap "$MT"
+  done
+fi
+
+# ---------------- probe1：单模型对照（判断"是模型不会做，还是集成把它毁了"）----------------
+if [ "$STAGE" = "probe1" ]; then
+  SMOKE=../datasets/utility/gsm8k_smoke${SMOKE_N}.jsonl
+  if [ ! -f "$SMOKE" ]; then head -"$SMOKE_N" "$GSM" > "$SMOKE"; fi
+  echo "===== [probe1] 单模型（base / IF / Hash / ImF）在 $SMOKE_N 条上的 GSM8K ====="
+  echo "注意：single_model_test.py 是**采样**解码（T=0.7, top_p=0.85），与集成的贪心解码不同 ⇒ 只看量级不看小数点"
+  for m in "$BASE" "$M_IF" "$M_HASH" "$M_IMF"; do
+    nm=$(basename "$m")
+    OUT="../outputs/smoke1_gsm_${nm}.jsonl"
+    echo "--- 单模型 $nm ---"
+    run python single_model_test.py --test_set "$SMOKE" --model_path1 "$m" \
+      --output_file "$OUT" --max_new_tokens "$MT"
+    python check_gsm_output.py "$OUT" --items "$SMOKE_N" --cap "$MT"
+  done
 fi
 
 # ---------------- run：正式跑 METHODS × SCENARIOS ----------------
