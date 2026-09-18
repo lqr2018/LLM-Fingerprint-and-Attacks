@@ -13,7 +13,9 @@ rows = list(csv.DictReader(open(root / "records" / "p0_results.csv", encoding="u
 MAIN = {
     "vanilla": "vanilla",
     "median": "median",
-    "temperature (T=1.0)": "temperature",
+    "temperature (T=0.5，主表口径)": "temperature_T0.5",
+    "temperature (T=0.75)": "temperature_T0.75",
+    "temperature (T=1.0，默认档)": "temperature",
     "temperature (T=1.25)": "temperature_T1.25",
     "clipping": "clipping",
     "confidence": "confidence",
