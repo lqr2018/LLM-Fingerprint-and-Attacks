@@ -27,6 +27,15 @@
 #   SCENARIOS="A Bimf Bif Bhash" bash run_gsm.sh run                    # 四个 utility 组全跑（+4 次）
 #
 # 命名：../outputs/p0_{A|Bif|Bhash|Bimf}_{method}_gsm.jsonl（`summarize_results.py` 可解析 ⇒ 自动进 CSV）
+#
+# ★消融档（会自动带档位后缀 ⇒ **不会覆盖** ⭐ 主档 p0_*_gap_supp_gsm.jsonl）：
+#   TAU_PCT=85 bash run_gsm.sh run     # τ=P85 → p0_*_gap_supp_gtau85a1_gsm.jsonl
+#   TAU_PCT=95 bash run_gsm.sh run     # τ=P95 → p0_*_gap_supp_gtau95a1_gsm.jsonl
+#   GAP_TAU=0  bash run_gsm.sh run     # τ=0（死区消融）→ p0_*_gap_supp_gtau0a1_gsm.jsonl
+#   ALPHA=2    bash run_gsm.sh run     # α=2（力度消融）→ p0_*_gap_supp_gtau90a2_gsm.jsonl
+#   T=1.0 METHODS=temperature bash run_gsm.sh run   # 温度档 → p0_*_temperature_T1.0_gsm.jsonl
+# ⚠️ 3fp（A）在 GSM8K 上处于地板区（0.21~0.27、四法配对全 ns，无区分度）
+#    ⇒ **消融只跑 1fp 三组**即可（省一半算力）：SCENARIOS="Bif Bhash Bimf" TAU_PCT=95 bash run_gsm.sh run
 # ⚠️ 必须用**本仓库修改版** `ensemble_logit.py`（GSM 的 label 已改为数值口径，否则 ACC 恒为 0）
 # ⚠️ 子集由 `prep` 阶段自动生成（从 gsm8k_300.jsonl 取前 GSM_N 条），**不需要手工 head**；
 #    数据集自动定位顺序：`gsm8k_${GSM_N}.jsonl` → `gsm8k_100.jsonl` → `gsm8k_300.jsonl`（命中非目标条数时会提示）。
@@ -50,6 +59,7 @@ GSM_N=${GSM_N:-100}                    # ★子集条数（默认 100：实测 ~
 FORCE=${FORCE:-}                       # prep 时 FORCE=1 重建子集（默认幂等跳过）
 PROGRESS=${PROGRESS:-5}                # 长跑一定要有进度，否则看不出是卡住还是在跑
 TAU_PCT=${TAU_PCT:-90}
+GAP_TAU=${GAP_TAU:-auto}               # gap_supp 的 τ 值：auto（按分位标定）/ 数值（如 0 = 死区消融）
 ALPHA=${ALPHA:-1}
 T=${T:-0.5}                            # 仅当 METHODS 含 temperature 时生效（主表口径 T=0.5）
 RUNS=0
@@ -189,7 +199,15 @@ if [ "$STAGE" = "run" ] || [ "$STAGE" = "all" ]; then
       extra=""
       msuf=""
       case "$m" in
-        gap_supp)    extra="--gap_tau auto --gap_tau_pct $TAU_PCT --alpha $ALPHA --clean_path $CLEAN" ;;
+        gap_supp)
+          extra="--gap_tau $GAP_TAU --gap_tau_pct $TAU_PCT --alpha $ALPHA --clean_path $CLEAN"
+          # ⚠️ 消融档必须带档位后缀，否则**会覆盖 ⭐ 主档文件** p0_*_gap_supp_gsm.jsonl
+          if [ "$GAP_TAU" != "auto" ]; then
+            msuf="_gtau${GAP_TAU}a${ALPHA}"
+          elif [ "$TAU_PCT" != "90" ] || [ "$ALPHA" != "1" ]; then
+            msuf="_gtau${TAU_PCT}a${ALPHA}"
+          fi
+          ;;
         thresh_ours) extra="--tau_pct $TAU_PCT --clean_path $CLEAN" ;;
         temperature) extra="--T $T"; msuf="_T${T}" ;;
       esac
