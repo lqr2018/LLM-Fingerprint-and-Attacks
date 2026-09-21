@@ -16,11 +16,15 @@
 #   bash run_gsm.sh clean                   # 删掉 outputs 里的 0 字节空壳（会导致汇总出 nan 行）
 #   bash run_gsm.sh all                     # = prep + clean + run + diag
 #
-# 默认配置（**最小决定性集合 = 6 次 × ~18 min ≈ 1.8 h**，2026-09-18 实测速度）：
+# 默认配置（**最小决定性集合 = 6 次 × ~37 min ≈ 3.7 h**）：
 #   METHODS="vanilla median gap_supp"   SCENARIOS="A Bimf"   MT=256   GSM_N=100
-#   （300 条约 55 min/次、6 次 ≈ 5.5 h；要 n=300 的分辨率：export GSM_N=300 后分别跑 prep / run / diag）
+#   （300 条约 110 min/次；要 n=300 的分辨率：export GSM_N=300 后分别跑 prep / run / diag）
 #     A    = Setting-A(3fp)：IF + Hash + ImF —— median 在 ARC 上领先我们最多的那组
 #     Bimf = Setting-B(1fp)：ImF + 2×base   —— vanilla 泄漏最高(0.70)、差距最大的一组
+#
+# ⚠️ **时间口径（2026-09-19 实测修正）**：GSM8K-100 × 256 token × 3 模型 = **≈37 min/次**（实测 21 次 / 13 h）。
+#    早先的"18 min/次"来自 **3fp 冒烟（55 s / 5 条）**——那组输出又短又乱（早早 EOS），**严重低估**；
+#    正常组会跑满 256 token 的 CoT，约为其 2 倍。排期请一律按 **37 min/次** 计（n=300 ⇒ ~110 min/次）。
 #
 # 扩展（各 +2 次长跑）：
 #   METHODS="vanilla median gap_supp temperature" bash run_gsm.sh run   # 加 T=0.5 档（跨任务验"投票类崩"）
@@ -55,8 +59,9 @@ SCENARIOS=${SCENARIOS:-"A Bimf"}
 SMOKE_SCEN=${SMOKE_SCEN:-"A Bimf"}     # smoke 阶段要探的场景（A=3fp 无干净模型；Bimf=1fp）
 SMOKE_N=${SMOKE_N:-5}                  # 小样本条数（probe1/smoke 共用）
 MT=${MT:-256}                          # GSM8K 是 CoT 长生成，**不要用 ARC 的 32**
-GSM_N=${GSM_N:-100}                    # ★子集条数（默认 100：实测 ~18 min/次；300 约 55 min/次）
+GSM_N=${GSM_N:-100}                    # ★子集条数（默认 100：**实测 ~37 min/次**；300 约 110 min/次）
 FORCE=${FORCE:-}                       # prep 时 FORCE=1 重建子集（默认幂等跳过）
+SKIP_EXIST=${SKIP_EXIST:-0}            # 1 = run 阶段跳过"已完成的同名文件"（行数 ≥ GSM_N）⇒ 重跑安全
 PROGRESS=${PROGRESS:-5}                # 长跑一定要有进度，否则看不出是卡住还是在跑
 TAU_PCT=${TAU_PCT:-90}
 GAP_TAU=${GAP_TAU:-auto}               # gap_supp 的 τ 值：auto（按分位标定）/ 数值（如 0 = 死区消融）
@@ -211,9 +216,14 @@ if [ "$STAGE" = "run" ] || [ "$STAGE" = "all" ]; then
         thresh_ours) extra="--tau_pct $TAU_PCT --clean_path $CLEAN" ;;
         temperature) extra="--T $T"; msuf="_T${T}" ;;
       esac
+      outf="../outputs/${prefix}_${m}${msuf}_gsm.jsonl"
+      if [ "$SKIP_EXIST" = "1" ] && [ -f "$outf" ] && [ "$(wc -l < "$outf" | tr -d ' ')" -ge "$GSM_N" ]; then
+        echo "跳过（已完成，$(wc -l < "$outf" | tr -d ' ') 行）：$outf"
+        continue
+      fi
       run python ensemble_logit.py --test_set "$GSM" \
         --model_path1 "$m1" --model_path2 "$m2" --model_path3 "$m3" \
-        --output_file "../outputs/${prefix}_${m}${msuf}_gsm.jsonl" \
+        --output_file "$outf" \
         --max_new_tokens "$MT" --method "$m" $extra --progress_every "$PROGRESS"
     done
   done
