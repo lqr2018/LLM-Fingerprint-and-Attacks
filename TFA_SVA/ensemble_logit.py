@@ -2,7 +2,8 @@
 """
 Logit-level ensemble（P2/P4/P5 通用）：
     3 个模型逐 token 融合 logits，支持多种融合方式：
-      vanilla / ours(disagreement suppression) / median / temperature / clipping / confidence / random
+      vanilla / ours(disagreement suppression) / median / temperature / clipping / clip_topk(温和 clipping，2026-09-22)
+    / confidence / random
       thresh_ours   : 整步门控（D(t) > τ 才抑制）
       maxdelta_gate : 逐坐标门控（判据 loo_max / solo）+ 抑制 α·1[crit>τ]·δ   （P1-3/P1-3b）
       gap_supp      : 「门控 × 差异量」p = α·1[gap>τ]·gap，gap = x₍₁₎ − x₍₂₎   （P1-3c 定式）
@@ -490,7 +491,7 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=40)
     parser.add_argument("--method", type=str, default="vanilla",
                         choices=["vanilla", "ours", "thresh_ours", "maxdelta_gate", "gap_supp", "random_gate",
-                                 "median", "temperature", "clipping", "confidence", "random"])
+                                 "median", "temperature", "clipping", "clip_topk", "confidence", "random"])
     parser.add_argument("--alpha", type=float, default=1.0, help="ours/random 的抑制强度")
     parser.add_argument("--T", type=float, default=1.0, help="temperature 的温度")
     parser.add_argument("--clip_c", type=float, default=None, help="clipping 的阈值（默认取 95 分位）")

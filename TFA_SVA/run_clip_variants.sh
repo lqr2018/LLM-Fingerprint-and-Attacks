@@ -81,16 +81,16 @@ loop_variants() {   # $1=阶段（fp/acc/gsm）；其余参数见各分支
       cv p0_Bhash hash "$FP_HASH" "$MT_HASH" "$M_HASH" "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" ""
       cv p0_Bimf imf   "$FP_IMF"  "$MT_IMF"  "$M_IMF"  "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" ""
     elif [ "$stage" = "acc" ]; then
-      cv p0_A      arc      "$ARC" "$MT_ARC" "$M_IF"   "$M_HASH" "$M_IMF" "$K" "$pct" "$beta" "$tag" "$TAGSUF_ACC"
-      cv p0_Bif    arc      "$ARC" "$MT_ARC" "$M_IF"   "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" "$TAGSUF_ACC"
-      cv p0_Bhash  arc      "$ARC" "$MT_ARC" "$M_HASH" "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" "$TAGSUF_ACC"
-      cv p0_Bimf   arc      "$ARC" "$MT_ARC" "$M_IMF"  "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" "$TAGSUF_ACC"
+      cv p0_A      arc      "$ARC" "$MT_ARC" "$M_IF"   "$M_HASH" "$M_IMF" "$K" "$pct" "$beta" "$tag" "$TAGSUF_ACC" 300
+      cv p0_Bif    arc      "$ARC" "$MT_ARC" "$M_IF"   "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" "$TAGSUF_ACC" 300
+      cv p0_Bhash  arc      "$ARC" "$MT_ARC" "$M_HASH" "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" "$TAGSUF_ACC" 300
+      cv p0_Bimf   arc      "$ARC" "$MT_ARC" "$M_IMF"  "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" "$TAGSUF_ACC" 300
     elif [ "$stage" = "gsm" ]; then
       if [ ! -f "$GSM" ]; then echo "缺 $GSM（先跑 run_gsm.sh prep）"; continue; fi
-      cv p0_A      gsm      "$GSM" "$MT_GSM" "$M_IF"   "$M_HASH" "$M_IMF" "$K" "$pct" "$beta" "$tag" ""
-      cv p0_Bif    gsm      "$GSM" "$MT_GSM" "$M_IF"   "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" ""
-      cv p0_Bhash  gsm      "$GSM" "$MT_GSM" "$M_HASH" "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" ""
-      cv p0_Bimf   gsm      "$GSM" "$MT_GSM" "$M_IMF"  "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" ""
+      cv p0_A      gsm      "$GSM" "$MT_GSM" "$M_IF"   "$M_HASH" "$M_IMF" "$K" "$pct" "$beta" "$tag" "" 100
+      cv p0_Bif    gsm      "$GSM" "$MT_GSM" "$M_IF"   "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" "" 100
+      cv p0_Bhash  gsm      "$GSM" "$MT_GSM" "$M_HASH" "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" "" 100
+      cv p0_Bimf   gsm      "$GSM" "$MT_GSM" "$M_IMF"  "$BASE"   "$BASE"   "$K" "$pct" "$beta" "$tag" "" 100
     fi
   done
 }
