@@ -132,3 +132,31 @@ def maxdelta_gate_fuse(stack, alpha=1.0, tau=0.0, criterion="loo_max",
     gate = (crit > float(tau)).float()                     # [V] 逐坐标 0/1
     n = stack.shape[0]
     return sum(stack[i] - alpha * gate * delta[i] for i in range(n)) / n
+
+
+def topk_cap_fuse(stack, topk=50, pct=90.0, beta=1.0):
+    """【温和 clipping，2026-09-22 新增】只在"头部"截断的 clipping 基线族。
+
+      c      = P{pct}（**各模型 top-K 值的并集**）              # ← 关键修复：阈值取自"头部"，不是全词表值分布
+      l̃_i(v) = l_i(v) − β·ReLU( l_i(v) − c )                    # β = 力度：0 ⇒ 完全不动手（≡ vanilla）；1 ⇒ 硬截断到 c
+      l_ens  = mean_i l̃_i(v)
+
+    **为什么旧 `clipping` 必崩（两条原因，这里各修一条）**
+      ① 旧版阈值 = **全词表 (~N×152k) 值分布的 P95** ⇒ 落在第 ~7.6k 名 ⇒ 远低于头部 ⇒ 把头（含全部有用信号）压平。
+         这里阈值取自 **top-K 并集**（默认 K=50）⇒ 只可能削掉头部极少数坐标。
+      ② 旧版固定**硬截断**（β=1）⇒ 大量坐标被拉成**精确并列** ⇒ `argmax` 落到**最小 token id**
+         （空格/标点/数字，Qwen 里 id 很小）⇒ 输出退化成低 id token 串（实测 ARC 0.00~0.06、GSM8K 0.0000）。
+         这里 β 可 < 1（**部分削减**）⇒ 保留坐标间的**相对次序**，避免并列退化；β 同时充当"力度旋钮"（与 α 同角色）。
+
+    性质：β=0 ⇒ 原样返回 `mean`（= vanilla）；β↑ ⇒ 头部压得越低（单调）；K ≥ V 且 pct 取大 ⇒ 趋近全词表分位的旧 clipping；
+          并列坐标（全体相同）不受影响；对任意 N 定义良好；对模型置换不变（靶子/类型无关）。
+    """
+    n, V = stack.shape
+    if n < 2:
+        return stack.mean(dim=0)
+    k = max(1, min(int(topk), V))
+    top = torch.topk(stack, k, dim=1).values.reshape(-1)              # [N*k]
+    c = float(torch.quantile(top.float(), float(pct) / 100.0).item())  # 阈值来自"头部"
+    if beta <= 0:
+        return stack.mean(dim=0)
+    return (stack - float(beta) * torch.clamp(stack - c, min=0.0)).mean(dim=0)

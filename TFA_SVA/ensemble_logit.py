@@ -38,7 +38,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def compute_ensemble_logits(logits, method="vanilla", alpha=1.0, T=1.0, clip_c=None, tau=None,
-                            criterion="loo_max", spike=None, gap_soft=0.0):
+                            criterion="loo_max", spike=None, gap_soft=0.0,
+                            clip_topk=50, clip_pct=90.0, clip_beta=1.0):
     """logits: list of [V] fp32 cpu tensor（各模型最后一步 logits）
     返回融合后的 [V] tensor。
 
@@ -115,6 +116,14 @@ def compute_ensemble_logits(logits, method="vanilla", alpha=1.0, T=1.0, clip_c=N
             cat = torch.cat([li.unsqueeze(0) for li in logits], dim=0)
             clip_c = torch.quantile(cat, 0.95).item()
         return sum(torch.clamp(li, max=clip_c) for li in logits) / N
+
+    elif method == "clip_topk":
+        # 【温和 clipping，2026-09-22 新增】只削"头部"，修复旧 clipping 的两个致命点：
+        #   ① 阈值 c 取自 **各模型 top-K 的并集**（而非全词表值分布的 P95 ⇒ 落第 ~7.6k 名、把头全压平）；
+        #   ② 用 β 做**部分削减** l̃ = l − β·ReLU(l − c)（β=1 即硬截断，会因精确并列让 argmax 掉到最小 token id）；
+        #   β=0 ⇒ 完全不动手（≡ vanilla）⇒ β 是"力度旋钮"（与 α 同角色）。数学在 gate_core.topk_cap_fuse。
+        return gate_core.topk_cap_fuse(torch.stack(logits), topk=clip_topk,
+                                       pct=clip_pct, beta=clip_beta)
 
     elif method == "confidence":
         # 按各模型 softmax 最大概率加权平均 logits
@@ -236,6 +245,7 @@ def _dump_topn(item_idx, step, method, logits, k):
 def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
                     method="vanilla", alpha=1.0, T=1.0, clip_c=None, tau=None,
                     criterion="loo_max", spike=SOLO_SPIKE_DEFAULT, gap_soft=0.0,
+                    clip_topk=50, clip_pct=90.0, clip_beta=1.0,
                     debug_fh=None, debug_k=0, item_idx=None,
                     logits_fh=None, logits_k=0, gate_per_coord=False):
     """单个问题：3 模型逐步 logit 融合（greedy），返回生成文本。
@@ -267,7 +277,8 @@ def ensemble_decode(models, toks, question, max_new_tokens, devices, eos_id,
 
         l_ens = compute_ensemble_logits(logits, method=method, alpha=alpha, T=T, clip_c=clip_c,
                                         tau=tau, criterion=criterion, spike=spike,
-                                        gap_soft=gap_soft)
+                                        gap_soft=gap_soft, clip_topk=clip_topk,
+                                        clip_pct=clip_pct, clip_beta=clip_beta)
         if debug_fh is not None and debug_k > 0:
             rec = _debug_record(item_idx, step, method, logits, l_ens, tau, debug_k, tok1,
                                 per_coord=gate_per_coord, criterion=criterion, spike=spike)
@@ -483,6 +494,12 @@ def main():
     parser.add_argument("--alpha", type=float, default=1.0, help="ours/random 的抑制强度")
     parser.add_argument("--T", type=float, default=1.0, help="temperature 的温度")
     parser.add_argument("--clip_c", type=float, default=None, help="clipping 的阈值（默认取 95 分位）")
+    parser.add_argument("--clip_topk", type=int, default=50,
+                        help="温和 clipping（clip_topk）的头部规模 K：阈值 c 取自各模型 top-K 值的并集分位")
+    parser.add_argument("--clip_pct", type=float, default=90.0,
+                        help="温和 clipping 的阈值分位（在 top-K 并集上取 P{pct}；越大越温和）")
+    parser.add_argument("--clip_beta", type=float, default=1.0,
+                        help="温和 clipping 的力度 β：l̃=l−β·ReLU(l−c)；0=不动手(=vanilla)、1=硬截断到 c")
     parser.add_argument("--tau_pct", type=float, default=90.0,
                         help="thresh_ours 的 Clean 数据百分位(85/90/95)；maxdelta_gate 时为 τ_md 的百分位"
                              "（loo_max 建议 90/95/99；solo 建议 85/90 —— solo 只在**正值**上取分位，"
@@ -675,6 +692,7 @@ def main():
                 question, args.max_new_tokens, (device1, device2, device3), eos_id,
                 method=args.method, alpha=args.alpha, T=args.T, clip_c=args.clip_c, tau=tau,
                 criterion=args.criterion, spike=spike, gap_soft=args.gap_soft,
+                clip_topk=args.clip_topk, clip_pct=args.clip_pct, clip_beta=args.clip_beta,
                 debug_fh=debug_fh, debug_k=args.debug_topk, item_idx=item_idx,
                 logits_fh=logits_fh, logits_k=args.debug_dump_logits,
                 gate_per_coord=(args.method == "maxdelta_gate"))

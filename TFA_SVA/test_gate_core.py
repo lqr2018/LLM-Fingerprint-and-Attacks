@@ -227,6 +227,55 @@ def test_random_gate():
     print("  [10] random_gate：等能量 / 位置随机 / 可复现 / N<2 ... OK")
 
 
+def test_topk_cap():
+    """温和 clipping（`topk_cap_fuse`）：手算对照 + β 单调 + **硬截断的并列退化** + 置换不变。
+
+    ⚠️ 分位约定：`torch.quantile(x, q)` 用 **index = q·(n−1) 的线性插值**（numpy 'linear' 同款）。
+    因此"top-K 并集的 P90"落在**头部之内**：K=50、N=3 时 n=150 ⇒ index=0.9·149=134.1
+    ⇒ 阈值 ≈ 并集的**第 16 大**值 ⇒ 默认配置只会削"头部前十几个坐标"（这正是"温和"的来源）。
+    """
+    # fixture A：3 模型 × 4 坐标，K=3（每模型取前 3 个值参与定阈值）
+    #   并集 = {30,20,10} ∪ {18,16,14} ∪ {9,8,7} = [7,8,9,10,14,16,18,20,30]（n=9）
+    #   → index = 0.9·8 = 7.2 ⇒ c = x7 + 0.2·(x8−x7) = 20 + 0.2·10 = **22**
+    L = torch.tensor([[30.0, 20.0, 10.0, 5.0],
+                      [18.0, 16.0, 14.0, 5.0],
+                      [9.0, 8.0, 7.0, 5.0]])
+    van = L.mean(dim=0)          # [19, 44/3, 31/3, 5]
+    # ① β=0 ⇒ 完全等于 vanilla（"不动手"端）
+    assert _close(G.topk_cap_fuse(L, topk=3, pct=90.0, beta=0.0), van)
+    # ② β=1 ⇒ 只有 >22 的值被截：coord0 的 30 → 22（其余不动，坐标3 在 top-3 之外也不受影响）
+    exp1 = torch.tensor([(22.0 + 18.0 + 9.0) / 3, (20.0 + 16.0 + 8.0) / 3,
+                         (10.0 + 14.0 + 7.0) / 3, 5.0])
+    got1 = G.topk_cap_fuse(L, topk=3, pct=90.0, beta=1.0)
+    assert _close(got1, exp1, tol=1e-4), (got1, exp1)
+    # ③ β=0.5 ⇒ 部分削减：30 → 30 − 0.5·(30−22) = 26
+    exp05 = torch.tensor([(26.0 + 18.0 + 9.0) / 3, (20.0 + 16.0 + 8.0) / 3,
+                          (10.0 + 14.0 + 7.0) / 3, 5.0])
+    assert _close(G.topk_cap_fuse(L, topk=3, pct=90.0, beta=0.5), exp05, tol=1e-4)
+    # ④ **"低于 c 的坐标完全不动"**：β=1 下 coord1/2/3 与 vanilla 完全一致
+    assert abs(float(got1[1]) - float(van[1])) < 1e-6 and abs(float(got1[3]) - float(van[3])) < 1e-6
+    # ⑤ β 单调：β↑ ⇒ 头部不升
+    vals = [float(G.topk_cap_fuse(L, topk=3, pct=90.0, beta=b).max()) for b in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    assert all(vals[i] >= vals[i + 1] - 1e-6 for i in range(len(vals) - 1)), vals
+    # ⑥ pct=90 时只有 1 个值被削（"温和"）；把 pct 降到 50 会削更多 ⇒ 分位是"力度"的另一个旋钮
+    assert int(((got1 - van).abs() > 1e-6).sum()) == 1, (got1 - van)
+    # ⑦ **硬截断（β=1）会把多个坐标压成同一值** —— 旧 clipping 崩的机制（argmax 只能按最小 token id 决出）
+    L2 = torch.tensor([[30.0, 20.0, 5.0],
+                       [30.0, 20.0, 5.0],
+                       [5.0, 5.0, 5.0]])
+    #   K=2 ⇒ 并集 = [5,5,5,20,20,30,30]（n=7）；pct=50 ⇒ index=0.5·6=3.0 ⇒ c = 20
+    hard = G.topk_cap_fuse(L2, topk=2, pct=50.0, beta=1.0)
+    assert abs(float(hard[0]) - float(hard[1])) < 1e-6, hard      # coord0 与 coord1 完全并列
+    soft = G.topk_cap_fuse(L2, topk=2, pct=50.0, beta=0.5)
+    assert float(soft[0]) > float(soft[1]) + 1.0, soft            # β<1 ⇒ 次序保住
+    # ⑧ 置换不变（靶子/类型无关）· N<2 ⇒ vanilla
+    for perm in ([2, 0, 1], [1, 2, 0]):
+        assert _close(G.topk_cap_fuse(L[perm], topk=3, pct=90.0, beta=0.5),
+                      G.topk_cap_fuse(L, topk=3, pct=90.0, beta=0.5))
+    assert _close(G.topk_cap_fuse(L[:1], topk=3, pct=90.0, beta=1.0), L[0])
+    print("  [11] topk_cap（温和 clipping）：手算 / 单调 / 并列退化 / 置换 ... OK")
+
+
 if __name__ == "__main__":
     print("gate_core 单元测试：")
     test_delta_and_criterion()
@@ -239,4 +288,5 @@ if __name__ == "__main__":
     test_gap_supp()
     test_gap_supp_offline_consistency()
     test_random_gate()
+    test_topk_cap()
     print("全部通过 ✅")

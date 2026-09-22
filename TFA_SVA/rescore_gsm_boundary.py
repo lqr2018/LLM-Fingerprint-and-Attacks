@@ -79,11 +79,99 @@ def score(items):
                 multi=multi, nan_orig=nan_o, nan_trunc=nan_t, ok_orig=ok_o, ok_trunc=ok_t)
 
 
+def mcnemar_exact(b, c):
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    return min(1.0, 2.0 * sum(math.comb(n, i) for i in range(k + 1)) / (2 ** n))
+
+
+def item_key(d):
+    return d.get("original_sln") or d.get("question")
+
+
+def correct_map(path):
+    """→ {item_key: 0/1}（**截断口径**下的对错向量）"""
+    items, _ = read_items(path)
+    out = {}
+    for d in items:
+        k = item_key(d)
+        if k is None or k in out:
+            continue
+        out[k] = 1 if gsm_extract_math_answer(truncate_at_boundary(d.get("pred_solution", ""))) == d.get("label") else 0
+    return out
+
+
+def parse_p0_sub(name):
+    m = re.match(r"p0_(A|Bif|Bhash|Bimf)_(.+)_gsm\.jsonl$", name)
+    return (m.group(1), m.group(2)) if m else None
+
+
+PAIRS = [("gap_supp", "vanilla"), ("gap_supp", "median"), ("gap_supp", "confidence"), ("gap_supp", "clipping"),
+         ("gap_supp", "gap_supp_gtau0a1"), ("gap_supp", "gap_supp_gtau85a1"), ("gap_supp", "gap_supp_gtau95a1"),
+         ("gap_supp", "gap_supp_gtau90a2"), ("gap_supp", "temperature_T0.5"), ("gap_supp", "temperature_T0.75"),
+         ("gap_supp", "temperature_T1.0"), ("gap_supp", "temperature_T1.25"),
+         ("vanilla", "median"), ("temperature_T0.5", "median"), ("gap_supp_gtau0a1", "gap_supp_gtau95a1")]
+
+
+def paired_report(files, out_path):
+    """在同一场景内做**截断口径**的 McNemar 精确配对检验 → CSV。"""
+    by_sub = {}
+    for p in files:
+        sub = parse_p0_sub(p.name)
+        if sub:
+            by_sub.setdefault(sub[0], {})[sub[1]] = p
+    ctrl = {p.name[len("ctrl_"):-len("_gsm.jsonl")]: p for p in files if p.name.startswith("ctrl_")}
+    rows = []
+
+    def add(tag, sub, a_name, b_name, pa, pb):
+        ca, cb = correct_map(pa), correct_map(pb)
+        keys = sorted(set(ca) & set(cb))
+        if not keys:
+            return
+        b_only = sum(1 for k in keys if ca[k] == 0 and cb[k] == 1)
+        a_only = sum(1 for k in keys if ca[k] == 1 and cb[k] == 0)
+        n = len(keys)
+        d = (a_only - b_only) * 100.0 / n
+        pv = mcnemar_exact(a_only, b_only)
+        rows.append(dict(scenario=sub, metric="trunc", method_a=a_name, method_b=b_name, n_paired=n,
+                         a_only_correct=a_only, b_only_correct=b_only, delta_pp="%+.2f" % d,
+                         p_mcnemar="%.4f" % pv, sig_5pct="yes" if pv < 0.05 else "no", note=tag))
+
+    for sub, methods in sorted(by_sub.items()):
+        for a, b in PAIRS:
+            if a in methods and b in methods:
+                add("p0", sub, a, b, methods[a], methods[b])
+    # 恒等式核对：1fp 的 median 应与 ctrl_base 完全一致（不一致对 = 0）
+    if "base" in ctrl:
+        for sub, methods in sorted(by_sub.items()):
+            if "median" in methods:
+                add("identity(median vs 3xbase)", sub, "median", "ctrl_base", methods["median"], ctrl["base"])
+    if rows:
+        with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        print("\n===== 截断口径下的配对检验（McNemar 精确，同题）=====")
+        print("%-18s %-24s %-24s %5s %8s %8s %8s %9s" % ("场景", "A", "B", "n", "a_only", "b_only", "Δ(pp)", "p"))
+        for r in rows:
+            print("%-18s %-24s %-24s %5d %8d %8d %8s %9s%s" % (
+                r["scenario"], r["method_a"], r["method_b"], r["n_paired"], r["a_only_correct"],
+                r["b_only_correct"], r["delta_pp"], r["p_mcnemar"], " ★" if r["sig_5pct"] == "yes" else ""))
+        print("已写出：%s" % out_path)
+    else:
+        print("未找到可配对的 p0_*_gsm.jsonl（需要同一场景内至少两个方法）")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default=str(HERE.parent / "outputs"))
     ap.add_argument("--out", default=str(HERE.parent / "records" / "gsm_boundary_rescore.csv"))
     ap.add_argument("--only", default=None, help="只看某个文件名（子串匹配）")
+    ap.add_argument("--paired", action="store_true",
+                    help="额外做**截断口径**的 McNemar 配对检验 → records/gsm_boundary_paired.csv")
+    ap.add_argument("--paired-out", default=str(HERE.parent / "records" / "gsm_boundary_paired.csv"))
     args = ap.parse_args()
 
     d = Path(args.dir)
@@ -129,6 +217,9 @@ def main():
                         "%+.4f" % (s["acc_trunc"] - s["acc_orig"]), s["multi"],
                         s["nan_orig"], s["nan_trunc"], s["acc_first"]])
     print("已写出：%s" % out)
+
+    if args.paired:
+        paired_report(files, args.paired_out)
 
 
 if __name__ == "__main__":
