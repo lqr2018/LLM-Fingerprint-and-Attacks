@@ -22,13 +22,23 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-DEGEN_CHAR_FRAC = 0.15   # 不同字符占比低于此 ⇒ 疑似复读/乱码
-DEGEN_RUN = 20           # 同一字符连续 ≥ 此长度 ⇒ 疑似复读
+DEGEN_RUN_MIN = 20         # 同一字符连续 ≥ 此长度、且占全文 ≥30% ⇒ 复读/乱码
+DEGEN_RUN_FRAC = 0.30
+DEGEN_NGRAM_K = 30         # 30 字符片段重复 ≥3 次 ⇒ 复读
+DEGEN_NGRAM_N = 3
 ANSWER_MARK = re.compile(r"####|the answer is|The answer is|boxed")
+BOUNDARY = re.compile(r"###\s*(?:human|Instruction|Assistant|System)\s*:", re.I)
 
 
 def analyze(text, cap):
-    """→ (字符长度, [疑似问题标签])"""
+    """→ (字符长度, [疑似问题标签])
+
+    ⚠️ 2026-09-22 修正：原判据用 `len(set(t))/len(t) < 0.15` 判"复读"，对**正常的长英文**
+    几乎恒为真（英文只有 ~40 个不同字符 / 900 字符 ≈ 0.045）⇒ 假阳性 100%。现改为：
+      ① 单字符连续 ≥20 且占全文 ≥30%（真正的 `0!!!!` 类）；② 30 字符片段重复 ≥3 次。
+    并新增「**多题续写**」标记（生成里出现新的 `### human/Instruction/Assistant:` 边界）——
+    这是 `base` 这类"文档续写"模型的典型失效，也是 GSM8K 末数字评分口径失效的根因。
+    """
     t = str(text or "")
     n = len(t)
     if n == 0:
@@ -37,10 +47,19 @@ def analyze(text, cap):
     if not re.search(r"\d", t):
         flags.append("无数字")
     runs = max((len(list(g)) for _, g in itertools.groupby(t)), default=0)
-    if runs >= DEGEN_RUN or (n >= 20 and len(set(t)) / float(n) < DEGEN_CHAR_FRAC):
+    rep_ngram = 1
+    if n >= DEGEN_NGRAM_K:
+        c = {}
+        for i in range(0, n - DEGEN_NGRAM_K + 1, 5):
+            g = t[i:i + DEGEN_NGRAM_K]
+            c[g] = c.get(g, 0) + 1
+        rep_ngram = max(c.values()) if c else 1
+    if (runs >= DEGEN_RUN_MIN and runs / float(n) >= DEGEN_RUN_FRAC) or rep_ngram >= DEGEN_NGRAM_N:
         flags.append("疑似复读")
     if cap and n >= 3 * cap and not ANSWER_MARK.search(t):
-        flags.append("疑似截断")
+        flags.append("长且无答案标记")
+    if BOUNDARY.search(t):
+        flags.append("多题续写")
     return n, flags
 
 
@@ -50,7 +69,7 @@ def one_file(path, items, cap):
         print(f"文件不存在: {path}")
         return
     match = nan = mismatch = missing = 0
-    marked = degen = nodigit = trunc = 0
+    marked = degen = nodigit = trunc = multi = 0
     lens, nan_examples, rows = [], [], []
     acc_first = None
     with open(p, encoding="utf-8") as f:
@@ -75,8 +94,10 @@ def one_file(path, items, cap):
                 degen += 1
             if "无数字" in flags:
                 nodigit += 1
-            if "疑似截断" in flags:
+            if "长且无答案标记" in flags:
                 trunc += 1
+            if "多题续写" in flags:
+                multi += 1
             if pred is None or label is None:
                 missing += 1
                 verdict = "缺字段"
@@ -103,8 +124,9 @@ def one_file(path, items, cap):
         srt = sorted(lens)
         print(f"生成字符长度: 中位 {srt[len(srt) // 2]} / 最短 {srt[0]} / 最长 {srt[-1]}")
     print(f"生成里出现答案标记（####/the answer is/boxed）: {marked}/{len(lens)}"
-          f" | 无数字: {nodigit} | 疑似复读: {degen} | 疑似截断: {trunc}"
-          f"（--cap={cap}，0 表示不判截断）")
+          f" | 无数字: {nodigit} | 疑似复读: {degen} | 长且无答案标记: {trunc} | **多题续写: {multi}**"
+          f"（--cap={cap}；『多题续写』= 生成里出现新的 `### human/Instruction/Assistant:` 边界，"
+          f"是 GSM8K 末数字评分口径失效的直接原因）")
     if items > 0:
         print(f"--- 逐条明细（前 {items} 条）---")
         for (i, n, flags, pred, label, verdict, gen) in rows[:items]:
