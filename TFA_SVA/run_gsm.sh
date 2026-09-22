@@ -242,4 +242,4 @@ fi
 echo ""
 echo "===== [stage=$STAGE] 共 $RUNS 次运行；结果在 ../outputs/p0_*_gsm.jsonl ====="
 echo "回传：../outputs/p0_*_gsm.jsonl + ../records/p0_results.csv + ../records/p0_results_paired.csv"
-echo "然后写进 doc/最终数据清单.md §2-T7（表：方法 × {3fp, 1fp-ImF} 的 GSM8K ACC + 配对 Δ）"
+echo "然后写进 doc/数据_第二任务GSM8K.md §T7（表：方法 × {3fp, 1fp-ImF} 的 GSM8K ACC + 配对 Δ）"

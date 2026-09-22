@@ -108,4 +108,4 @@ fi
 echo ""
 echo "===== [stage=$STAGE, pcts=$PCTS] 共 $RUNS 次运行；结果在 ../outputs/gsp_*.jsonl ====="
 echo "汇总：python summarize_results.py --paired --out ../records/p0_results.csv"
-echo "（回传 records/p0_results.csv 后，把 τ 曲线写进 doc/最终数据清单.md §2-T8）"
+echo "（回传 records/p0_results.csv 后，把 τ 曲线写进 doc/数据_消融与机制.md §T8）"

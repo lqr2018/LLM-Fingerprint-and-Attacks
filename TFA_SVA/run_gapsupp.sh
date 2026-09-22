@@ -23,7 +23,7 @@
 #   ⭐ 档1 gap_supp τ=clean P90 α=1   ← 门控当触发器 + α=1 完全消除（性质最干净）
 #      档2 gap_supp τ=clean P90 α=2   ← 更强力度（离线：3fp 上误伤↑，需真跑裁决）
 #      档3 gap_supp τ=0          α=1   ← 消融：无死区（= 纯"削平顶部间隙"，扰动↑）
-#   （`random_gate` 档已弃用：决策 2026-09-16 —— random 系基线不进主表，见 doc/最终数据清单.md §8-I）
+#   （`random_gate` 档已弃用：决策 2026-09-16 —— random 系基线不进主表，见 doc/口径与风险登记.md §8-I）
 
 cd "$(dirname "$0")"
 STAGE=${1:-fp1}
@@ -56,7 +56,7 @@ VARIANTS=(
   "gap_supp auto 90 1 gtau90a1"
   "gap_supp auto 90 2 gtau90a2"
   "gap_supp 0    90 1 gtau0a1"
-  # ★已弃用（决策 2026-09-16）：random 系基线不进论文主表（见 doc/最终数据清单.md §8-I）。
+  # ★已弃用（决策 2026-09-16）：random 系基线不进论文主表（见 doc/口径与风险登记.md §8-I）。
   #   如需"等能量、随机位置"的归因对照实验，取消下面一行的注释并用 SUBSET=ctrl：
   # "random_gate auto 90 1 rgau90a1"
 )
