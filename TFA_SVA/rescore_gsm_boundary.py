@@ -112,7 +112,14 @@ PAIRS = [("gap_supp", "vanilla"), ("gap_supp", "median"), ("gap_supp", "confiden
          ("gap_supp", "gap_supp_gtau0a1"), ("gap_supp", "gap_supp_gtau85a1"), ("gap_supp", "gap_supp_gtau95a1"),
          ("gap_supp", "gap_supp_gtau90a2"), ("gap_supp", "temperature_T0.5"), ("gap_supp", "temperature_T0.75"),
          ("gap_supp", "temperature_T1.0"), ("gap_supp", "temperature_T1.25"),
-         ("vanilla", "median"), ("temperature_T0.5", "median"), ("gap_supp_gtau0a1", "gap_supp_gtau95a1")]
+         ("vanilla", "median"), ("temperature_T0.5", "median"), ("gap_supp_gtau0a1", "gap_supp_gtau95a1"),
+         # 温和 clipping 族（clip_topk，2026-09-22 立项）——GSM8K 上也要与主对照配齐（缺的会自动跳过）
+         ("gap_supp", "clip_topk_ctk50p90b1.0"), ("gap_supp", "clip_topk_ctk50p50b0.5"),
+         ("gap_supp_gtau90a2", "clip_topk_ctk50p90b1.0"),
+         ("vanilla", "clip_topk_ctk50p90b1.0"), ("vanilla", "clip_topk_ctk50p50b0.5"),
+         ("median", "clip_topk_ctk50p90b1.0"), ("median", "clip_topk_ctk50p50b0.5"),
+         ("clipping", "clip_topk_ctk50p90b1.0"),
+         ("clip_topk_ctk50p50b0.5", "clip_topk_ctk50p90b1.0")]
 
 
 def paired_report(files, out_path):
