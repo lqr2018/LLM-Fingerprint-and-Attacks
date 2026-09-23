@@ -17,6 +17,12 @@
 #   VARIANTS="50:90:1.0" bash run_clip_variants.sh gsm             # ③（可选）GSM8K 4 组/档
 #   bash run_clip_variants.sh diag                                 # ④ 汇总 + 体检
 #
+# 离线参数网格（0 GPU，选点用；2026-09-23 扫了 44 档 × 4 场景 ⇒ records/offline_clip_grid.csv）：
+#   python offline_clip_variants.py --variants "50:90:0.75,50:75:1.0" --csv ../records/offline_clip_grid.csv
+#   （仓库根目录跑：python TFA_SVA/offline_clip_variants.py --variants "..." --csv records/offline_clip_grid.csv）
+#   ⚠️ 离线只能"选点 + 排除退化档"，**不能**预测端到端 ACC（p90β1.0 离线看很温和、端到端崩）
+#   🟡 由网格选出的中间档（待跑）：50:90:0.75（同阈值、力度减 1/4）· 50:75:1.0（力度不变、阈值外移）
+#
 # VARIANTS 语法：`K:pct:beta`，可带标签 `K:pct:beta:tag`（默认 tag = ctk{K}p{pct}b{beta}）
 #   默认三档（离线预演已筛过，见 doc/主对比表_gap_supp.md 表 7）：
 #     50:90:1.0   ← 离线力度最大（改判 7~13%）、且"温和阈值 ⇒ 硬截断不会退化成低 id 串"

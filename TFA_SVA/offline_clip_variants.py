@@ -88,26 +88,26 @@ def main():
         van_ids.sort()
         print("【%s】步数 %d ｜ **vanilla**：离群胜出 %.0f%% ｜ argmax id 中位 **%d**" % (
             tag, n, 100.0 * van_fp / n, van_ids[len(van_ids) // 2]))
-            for (K, pct, beta, lab) in variants:
-                fp = chg = 0
-                vids = []
-                for ids, S in steps:
-                    gap, _ = G.argmax_gap(S, model_dim=0)
-                    out_id = ids[int(gap.reshape(-1).argmax())]
-                    fused = G.topk_cap_fuse(S, topk=K, pct=pct, beta=beta)
-                    fid = argmax_id(ids, fused)
-                    fp += int(fid == out_id)
-                    chg += int(fid != argmax_id(ids, S.mean(dim=0)))
-                    vids.append(fid)
-                vids.sort()
-                print("        K=%-3d pct=%-5.0f β=%-4.2f ｜ 离群胜出 %4.0f%% ｜ 改判 %4.0f%% ｜ argmax id 中位 %6d" % (
-                    K, pct, beta, 100.0 * fp / n, 100.0 * chg / n, vids[len(vids) // 2]))
-                rows.append(dict(scenario=tag, K=K, pct="%.0f" % pct, beta="%.2f" % beta,
-                                 steps=n, outlier_wins_pct="%.1f" % (100.0 * fp / n),
-                                 change_pct="%.1f" % (100.0 * chg / n),
-                                 argmax_id_median=vids[len(vids) // 2],
-                                 vanilla_outlier_wins_pct="%.1f" % (100.0 * van_fp / n),
-                                 vanilla_argmax_id_median=van_ids[len(van_ids) // 2]))
+        for (K, pct, beta, lab) in variants:
+            fp = chg = 0
+            vids = []
+            for ids, S in steps:
+                gap, _ = G.argmax_gap(S, model_dim=0)
+                out_id = ids[int(gap.reshape(-1).argmax())]
+                fused = G.topk_cap_fuse(S, topk=K, pct=pct, beta=beta)
+                fid = argmax_id(ids, fused)
+                fp += int(fid == out_id)
+                chg += int(fid != argmax_id(ids, S.mean(dim=0)))
+                vids.append(fid)
+            vids.sort()
+            print("        K=%-3d pct=%-5.0f β=%-4.2f ｜ 离群胜出 %4.0f%% ｜ 改判 %4.0f%% ｜ argmax id 中位 %6d" % (
+                K, pct, beta, 100.0 * fp / n, 100.0 * chg / n, vids[len(vids) // 2]))
+            rows.append(dict(scenario=tag, K=K, pct="%.0f" % pct, beta="%.2f" % beta,
+                             steps=n, outlier_wins_pct="%.1f" % (100.0 * fp / n),
+                             change_pct="%.1f" % (100.0 * chg / n),
+                             argmax_id_median=vids[len(vids) // 2],
+                             vanilla_outlier_wins_pct="%.1f" % (100.0 * van_fp / n),
+                             vanilla_argmax_id_median=van_ids[len(van_ids) // 2]))
         # 参考：模拟“旧 clipping 把全体压平” ⇒ argmax = 记录坐标里 **id 最小**者
         mn = sorted(min(ids) for ids, _ in steps)
         print("        （旧 clipping 模拟：全体压平 ⇒ argmax = 记录坐标中最小 id，中位 = **%d** ⇒ 极低 id 档；"
