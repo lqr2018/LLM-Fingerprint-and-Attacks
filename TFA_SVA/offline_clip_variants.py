@@ -55,11 +55,14 @@ def main():
                     help="逗号分隔的 K:pct:beta")
     ap.add_argument("--cap", type=float, default=-1.0,
                     help="模拟旧 clipping 的“极低阈值”（默认 = 记录值最小值 −1）")
+    ap.add_argument("--csv", default=None,
+                    help="把结果同时写成 CSV（留档/复现用；默认不写）")
     args = ap.parse_args()
     variants = []
     for v in args.variants.split(","):
         k, p, b = v.split(":")
         variants.append((int(k), float(p), float(b), v))
+    rows = []
 
     print("===== 温和 clipping 离线预演（决策级，仅在已记录轨迹上） =====")
     print("指标定义：")
@@ -85,25 +88,39 @@ def main():
         van_ids.sort()
         print("【%s】步数 %d ｜ **vanilla**：离群胜出 %.0f%% ｜ argmax id 中位 **%d**" % (
             tag, n, 100.0 * van_fp / n, van_ids[len(van_ids) // 2]))
-        for (K, pct, beta, lab) in variants:
-            fp = chg = 0
-            vids = []
-            for ids, S in steps:
-                gap, _ = G.argmax_gap(S, model_dim=0)
-                out_id = ids[int(gap.reshape(-1).argmax())]
-                fused = G.topk_cap_fuse(S, topk=K, pct=pct, beta=beta)
-                fid = argmax_id(ids, fused)
-                fp += int(fid == out_id)
-                chg += int(fid != argmax_id(ids, S.mean(dim=0)))
-                vids.append(fid)
-            vids.sort()
-            print("        K=%-3d pct=%-5.0f β=%-4.2f ｜ 离群胜出 %4.0f%% ｜ 改判 %4.0f%% ｜ argmax id 中位 %6d" % (
-                K, pct, beta, 100.0 * fp / n, 100.0 * chg / n, vids[len(vids) // 2]))
+            for (K, pct, beta, lab) in variants:
+                fp = chg = 0
+                vids = []
+                for ids, S in steps:
+                    gap, _ = G.argmax_gap(S, model_dim=0)
+                    out_id = ids[int(gap.reshape(-1).argmax())]
+                    fused = G.topk_cap_fuse(S, topk=K, pct=pct, beta=beta)
+                    fid = argmax_id(ids, fused)
+                    fp += int(fid == out_id)
+                    chg += int(fid != argmax_id(ids, S.mean(dim=0)))
+                    vids.append(fid)
+                vids.sort()
+                print("        K=%-3d pct=%-5.0f β=%-4.2f ｜ 离群胜出 %4.0f%% ｜ 改判 %4.0f%% ｜ argmax id 中位 %6d" % (
+                    K, pct, beta, 100.0 * fp / n, 100.0 * chg / n, vids[len(vids) // 2]))
+                rows.append(dict(scenario=tag, K=K, pct="%.0f" % pct, beta="%.2f" % beta,
+                                 steps=n, outlier_wins_pct="%.1f" % (100.0 * fp / n),
+                                 change_pct="%.1f" % (100.0 * chg / n),
+                                 argmax_id_median=vids[len(vids) // 2],
+                                 vanilla_outlier_wins_pct="%.1f" % (100.0 * van_fp / n),
+                                 vanilla_argmax_id_median=van_ids[len(van_ids) // 2]))
         # 参考：模拟“旧 clipping 把全体压平” ⇒ argmax = 记录坐标里 **id 最小**者
         mn = sorted(min(ids) for ids, _ in steps)
         print("        （旧 clipping 模拟：全体压平 ⇒ argmax = 记录坐标中最小 id，中位 = **%d** ⇒ 极低 id 档；"
               "真实阈值更低 ⇒ 实际只会更小）" % mn[len(mn) // 2])
         print()
+
+    if args.csv and rows:
+        import csv as _csv
+        with open(args.csv, "w", newline="", encoding="utf-8-sig") as f:
+            w = _csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        print("已写出（%d 行）：%s" % (len(rows), args.csv))
 
 
 if __name__ == "__main__":

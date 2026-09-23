@@ -4,7 +4,7 @@
 用法：python TFA_SVA/explain_temperature_effect.py
 
 ⚠️ 本脚本**不重写算子**：本文方法直接 import `gate_core.gap_suppress_fuse`（与真跑同一定义）。
-结论（与真跑一致，见 records/主对比表_gap_supp.md 附表 T1b）：
+结论（与真跑一致，见 doc/主对比表_gap_supp.md 附表 A）：
  ① **饱和 vs 温和的不对称**：指纹模型在指纹 token 上的 logit 领先通常极大（≥10）⇒ softmax 已饱和（≈1），对 T 不敏感；
     干净模型的领先很小（~1-3）⇒ 概率峰对 T 很敏感。于是 `mean_i softmax(l_i/T)` 里 **T↑ 会摊薄干净模型的票**，指纹票相对更重。
  ② **交叉温度 T\\***：单坐标上"干净共识 vs 指纹"谁赢由 T 决定；**指纹越强 ⇒ T\\* 越小**（需要更尖锐才投得掉它）。

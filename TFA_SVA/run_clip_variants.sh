@@ -18,7 +18,7 @@
 #   bash run_clip_variants.sh diag                                 # ④ 汇总 + 体检
 #
 # VARIANTS 语法：`K:pct:beta`，可带标签 `K:pct:beta:tag`（默认 tag = ctk{K}p{pct}b{beta}）
-#   默认三档（离线预演已筛过，见 records/主对比表_gap_supp.md 表 7）：
+#   默认三档（离线预演已筛过，见 doc/主对比表_gap_supp.md 表 7）：
 #     50:90:1.0   ← 离线力度最大（改判 7~13%）、且"温和阈值 ⇒ 硬截断不会退化成低 id 串"
 #     50:50:0.5   ← 中间档
 #     50:10:0.5   ← 更温和（预期"几乎没用"，作无效端对照）
